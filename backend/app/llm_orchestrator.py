@@ -1,11 +1,11 @@
-"""
-LLM orchestration with tool calling. Supports OpenAI, Claude, and demo mode.
-When LLM_PROVIDER=local, uses HTTP endpoint. Otherwise uses OpenAI or Claude.
-"""
-import os
+"""LLM orchestration and deterministic demo-mode agent behavior."""
 import json
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Any, Optional
+
 import httpx
-from typing import Any
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "demo")
@@ -15,71 +15,92 @@ LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://localhost:11434/v1")
 
 
 def _get_tools_for_openai() -> list:
-    """Format MCP tools as OpenAI function schema."""
     meta = _fetch_tools_metadata()
-    functions = []
-    for t in meta:
-        functions.append({
+    return [
+        {
             "type": "function",
             "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["input_schema"],
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
             },
-        })
-    return functions
+        }
+        for tool in meta
+    ]
 
 
 def _fetch_tools_metadata() -> list:
-    """Fetch tools from MCP registry. Use local import when in-process to avoid self-request."""
     try:
         from app.mcp_registry import get_tools_metadata
+
         return get_tools_metadata(BASE_URL)
     except Exception:
         pass
+
     try:
-        r = httpx.get(f"{BASE_URL}/mcp/tools", timeout=5)
-        if r.status_code == 200:
-            return r.json()
+        response = httpx.get(f"{BASE_URL}/mcp/tools", timeout=5)
+        if response.status_code == 200:
+            return response.json()
     except Exception:
         pass
+
     return []
 
 
 def _call_tool(tool_name: str, arguments: dict, db=None) -> Any:
-    """Call MCP tool via HTTP or direct invocation when db is provided (in-process)."""
     if db is not None:
         try:
             from app.tools import check_availability, create_appointment, query_stats, send_notification
+
             handlers = {
-                "check_availability": lambda: check_availability(db, arguments.get("doctor_name", ""), arguments.get("date_str", "")),
-                "create_appointment": lambda: create_appointment(db, arguments.get("doctor_name", ""), arguments.get("patient_name", ""),
-                    arguments.get("patient_email", ""), slot_id=arguments.get("slot_id"), date_str=arguments.get("date_str"),
-                    start_time_str=arguments.get("start_time_str"), symptom=arguments.get("symptom", "general")),
-                "query_stats": lambda: query_stats(db, doctor_name=arguments.get("doctor_name"), start_date=arguments.get("start_date"),
-                    end_date=arguments.get("end_date"), symptom_filter=arguments.get("symptom_filter")),
-                "send_notification": lambda: send_notification(db, arguments.get("recipient", ""), arguments.get("message", ""), arguments.get("channel", "slack")),
+                "check_availability": lambda: check_availability(
+                    db, arguments.get("doctor_name", ""), arguments.get("date_str", "")
+                ),
+                "create_appointment": lambda: create_appointment(
+                    db,
+                    arguments.get("doctor_name", ""),
+                    arguments.get("patient_name", ""),
+                    arguments.get("patient_email", ""),
+                    slot_id=arguments.get("slot_id"),
+                    date_str=arguments.get("date_str"),
+                    start_time_str=arguments.get("start_time_str"),
+                    symptom=arguments.get("symptom", "general"),
+                ),
+                "query_stats": lambda: query_stats(
+                    db,
+                    doctor_name=arguments.get("doctor_name"),
+                    start_date=arguments.get("start_date"),
+                    end_date=arguments.get("end_date"),
+                    symptom_filter=arguments.get("symptom_filter"),
+                ),
+                "send_notification": lambda: send_notification(
+                    db,
+                    arguments.get("recipient", ""),
+                    arguments.get("message", ""),
+                    arguments.get("channel", "slack"),
+                ),
             }
             if tool_name in handlers:
                 return handlers[tool_name]()
-        except Exception as e:
-            return {"error": str(e)}
+        except Exception as exc:
+            return {"error": str(exc)}
+
     try:
-        r = httpx.post(
+        response = httpx.post(
             f"{BASE_URL}/mcp/tools/{tool_name}/call",
             json=arguments,
             timeout=30,
         )
-        if r.status_code == 200:
-            return r.json()
-        return {"error": r.text}
-    except Exception as e:
-        return {"error": str(e)}
+        if response.status_code == 200:
+            return response.json()
+        return {"error": response.text}
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
-def build_messages_from_history(db, session_primary_id: int, last_n: int = 10) -> list:
-    """Build message list from PromptHistory for context."""
+def build_messages_from_history(db, session_primary_id: int, last_n: int = 12) -> list:
     from app.models import PromptHistory
+
     history = (
         db.query(PromptHistory)
         .filter(PromptHistory.session_id == session_primary_id)
@@ -88,144 +109,236 @@ def build_messages_from_history(db, session_primary_id: int, last_n: int = 10) -
         .all()
     )
     history = list(reversed(history))
+
     messages = []
-    for h in history:
-        if h.role == "user":
-            messages.append({"role": "user", "content": h.content})
-        elif h.role == "assistant":
-            messages.append({"role": "assistant", "content": h.content})
+    for item in history:
+        if item.role == "user":
+            messages.append({"role": "user", "content": item.content})
+        elif item.role == "assistant":
+            messages.append({"role": "assistant", "content": item.content})
     return messages
 
 
 def _get_system_prompt() -> str:
-    tools_desc = json.dumps(_fetch_tools_metadata(), indent=2)
-    return f"""You are a medical appointment assistant. You help patients book appointments with doctors.
-
-Available MCP tools (call POST /mcp/tools/{{name}}/call with JSON body):
-{tools_desc}
-
-Workflow:
-1. For "check availability" - use check_availability with doctor_name and date_str (YYYY-MM-DD).
-2. For "book appointment" - use create_appointment with doctor_name, patient_name, patient_email, and slot_id (from availability) or date_str+start_time_str.
-3. For doctor stats - use query_stats.
-4. For notifications - use send_notification.
-
-If the user mentions "tomorrow", resolve to the actual date in YYYY-MM-DD.
-Respond naturally and confirm bookings clearly."""
+    tools = json.dumps(_fetch_tools_metadata(), indent=2)
+    return (
+        "You are a medical appointment assistant that can discover and call MCP tools.\n"
+        "Use check_availability before create_appointment when the user asks to book.\n"
+        "Use query_stats for doctor reporting and send_notification for doctor delivery.\n"
+        f"Available tools:\n{tools}"
+    )
 
 
-def get_llm_response(messages: list, db=None) -> tuple[str, list]:
-    """
-    Call LLM with tool support. Returns (final_text, list_of_tool_calls_made).
-    In demo mode, uses rule-based tool invocation.
-    """
+def _extract_email(text: str) -> Optional[str]:
+    match = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text or "")
+    return match.group(0) if match else None
+
+
+def _extract_name(text: str) -> Optional[str]:
+    patterns = [
+        r"(?:my name is|i am|this is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+        r"for\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _extract_slot_id(text: str) -> Optional[int]:
+    match = re.search(r"\bslot\s+(\d+)\b", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_time(text: str) -> Optional[str]:
+    explicit = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if explicit:
+        return f"{int(explicit.group(1)):02d}:{explicit.group(2)}"
+
+    am_pm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text, re.IGNORECASE)
+    if am_pm:
+        hour = int(am_pm.group(1))
+        minute = int(am_pm.group(2) or "0")
+        suffix = am_pm.group(3).lower()
+        if suffix == "pm" and hour != 12:
+            hour += 12
+        if suffix == "am" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute:02d}"
+    return None
+
+
+def _resolve_date(text: str) -> str:
+    lowered = (text or "").lower()
+    now = datetime.now()
+
+    if "today" in lowered:
+        return now.strftime("%Y-%m-%d")
+    if "tomorrow" in lowered:
+        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    weekdays = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+    for day_name, weekday_index in weekdays.items():
+        if day_name in lowered:
+            target = now
+            while target.weekday() != weekday_index:
+                target += timedelta(days=1)
+            if target.date() == now.date():
+                target += timedelta(days=7)
+            return target.strftime("%Y-%m-%d")
+
+    return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _resolve_doctor_name(text: str, messages: list[dict]) -> str:
+    combined = " ".join(
+        [m.get("content", "") for m in messages if m.get("role") in {"user", "assistant"}]
+    )
+    haystack = f"{combined} {text}".lower()
+    if "smith" in haystack:
+        return "Dr. Smith"
+    return "Dr. Ahuja"
+
+
+def _latest_user_context(messages: list[dict]) -> dict[str, Any]:
+    context = {"email": None, "name": None, "doctor": None, "date_str": None}
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        context["email"] = _extract_email(content) or context["email"]
+        context["name"] = _extract_name(content) or context["name"]
+        if "dr." in content.lower() or "doctor" in content.lower():
+            context["doctor"] = _resolve_doctor_name(content, messages)
+        if any(word in content.lower() for word in ["today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]):
+            context["date_str"] = _resolve_date(content)
+    return context
+
+
+def get_llm_response(messages: list, db=None, patient_context: Optional[dict] = None) -> tuple[str, list]:
     if LLM_PROVIDER == "demo":
-        return _demo_mode_response(messages, db)
+        return _demo_mode_response(messages, db, patient_context or {})
     if LLM_PROVIDER == "openai" and OPENAI_API_KEY:
         return _openai_response(messages, db)
     if LLM_PROVIDER == "anthropic" and ANTHROPIC_API_KEY:
         return _anthropic_response(messages, db)
     if LLM_PROVIDER == "local":
         return _local_llm_response(messages, db)
-    return _demo_mode_response(messages, db)
+    return _demo_mode_response(messages, db, patient_context or {})
 
 
-def _demo_mode_response(messages: list, db=None) -> tuple[str, list]:
-    """
-    Demo mode: parse user intent and call tools directly without real LLM.
-    Simulates agentic flow for testing.
-    """
+def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict] = None) -> tuple[str, list]:
+    patient_context = patient_context or {}
     user_content = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            user_content = m.get("content", "")
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            user_content = message.get("content", "")
             break
 
     lower = user_content.lower()
-    tool_calls = []
+    tool_calls: list[dict[str, Any]] = []
+    context = _latest_user_context(messages)
+    doctor_name = _resolve_doctor_name(user_content, messages)
+    date_str = context["date_str"] or _resolve_date(user_content)
+    patient_email = (
+        patient_context.get("patient_email")
+        or _extract_email(user_content)
+        or context["email"]
+        or "patient@demo.local"
+    )
+    patient_name = (
+        patient_context.get("patient_name")
+        or _extract_name(user_content)
+        or context["name"]
+        or "Guest Patient"
+    )
 
-    # Check intent: availability
-    if "availability" in lower or "available" in lower or "slot" in lower or "book" in lower or "appointment" in lower:
-        doctor_name = "Dr. Ahuja"
-        if "dr." in lower or "doctor" in lower:
-            for part in user_content.split():
-                if part.lower().startswith("dr.") or (len(part) > 3 and part[0].isupper()):
-                    if "ahuja" in part.lower() or "smith" in part.lower():
-                        doctor_name = part if part.lower().startswith("dr.") else f"Dr. {part}"
-        from datetime import datetime, timedelta
-        date_str = ""
-        if "tomorrow" in lower:
-            date_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        elif "friday" in lower or "next friday" in lower:
-            d = datetime.now()
-            while d.weekday() != 4:
-                d += timedelta(days=1)
-            date_str = d.strftime("%Y-%m-%d")
-        else:
-            date_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    wants_booking = any(word in lower for word in ["book", "schedule", "confirm"])
+    slot_id = _extract_slot_id(user_content)
+    time_str = _extract_time(user_content)
 
-        result = _call_tool("check_availability", {"doctor_name": doctor_name, "date_str": date_str}, db)
-        tool_calls.append({"tool": "check_availability", "arguments": {"doctor_name": doctor_name, "date_str": date_str}, "result": result})
+    if wants_booking and (slot_id is not None or time_str):
+        booking_args = {
+            "doctor_name": doctor_name,
+            "patient_name": patient_name,
+            "patient_email": patient_email,
+        }
+        if slot_id is not None:
+            booking_args["slot_id"] = slot_id
+        if time_str:
+            booking_args["date_str"] = date_str
+            booking_args["start_time_str"] = time_str
 
-        slots = result.get("available_slots", [])
-        if slots:
-            resp = f"Here are the available slots for {doctor_name} on {date_str}:\n"
-            for s in slots[:5]:
-                resp += f"- Slot {s['slot_id']}: {s['start_time']} - {s['end_time']}\n"
-            resp += "\nTo book, say something like: 'Please book slot X' or 'Book the 9:00 AM slot' with your name and email."
-        else:
-            resp = result.get("error") or f"No available slots found for {doctor_name} on {date_str}."
-        return resp, tool_calls
-
-    # Check intent: book
-    if "book" in lower and ("slot" in lower or any(c.isdigit() for c in user_content)):
-        doctor_name = "Dr. Ahuja"
-        slot_id = None
-        for w in user_content.replace(",", " ").split():
-            if w.isdigit():
-                slot_id = int(w)
-                break
-        if not slot_id:
-            return "Please specify which slot number to book (e.g. 'Book slot 1').", []
-
-        # Extract name/email from context or use defaults for demo
-        patient_name = "Demo Patient"
-        patient_email = "demo@example.com"
-        for line in messages:
-            c = (line.get("content") or "")
-            if "@" in c:
-                for part in c.split():
-                    if "@" in part and "." in part:
-                        patient_email = part.strip(".,")
-                        break
-        result = _call_tool(
-            "create_appointment",
+        booking_result = _call_tool("create_appointment", booking_args, db)
+        tool_calls.append(
             {
-                "doctor_name": doctor_name,
-                "patient_name": patient_name,
-                "patient_email": patient_email,
-                "slot_id": slot_id,
-            },
-            db,
+                "tool": "create_appointment",
+                "arguments": booking_args,
+                "result": booking_result,
+            }
         )
-        tool_calls.append({
-            "tool": "create_appointment",
-            "arguments": {"doctor_name": doctor_name, "patient_name": patient_name, "patient_email": patient_email, "slot_id": slot_id},
-            "result": result,
-        })
 
-        if result.get("success"):
+        if booking_result.get("success"):
             return (
-                f"✓ Appointment confirmed! Dr. {result.get('doctor')} on {result.get('date')} "
-                f"at {result.get('start_time')}. Confirmation email sent to {patient_email}.",
+                f"Appointment confirmed for {booking_result['patient']} with {booking_result['doctor']} "
+                f"on {booking_result['date']} at {booking_result['start_time']}. "
+                f"A confirmation was sent to {booking_result['patient_email']}.",
                 tool_calls,
             )
-        return result.get("error", "Booking failed."), tool_calls
+        return booking_result.get("error", "Booking failed."), tool_calls
 
-    # Default
+    wants_availability = any(
+        word in lower
+        for word in ["availability", "available", "slot", "slots", "tomorrow", "today", "morning", "afternoon"]
+    ) or ("appointment" in lower and not wants_booking)
+
+    if wants_availability:
+        result = _call_tool(
+            "check_availability",
+            {"doctor_name": doctor_name, "date_str": date_str},
+            db,
+        )
+        tool_calls.append(
+            {
+                "tool": "check_availability",
+                "arguments": {"doctor_name": doctor_name, "date_str": date_str},
+                "result": result,
+            }
+        )
+        slots = result.get("available_slots", [])
+        if not slots:
+            return result.get("error") or f"No available slots found for {doctor_name} on {date_str}.", tool_calls
+
+        if "morning" in lower:
+            slots = [slot for slot in slots if slot["start_time"] < "12:00"] or slots
+        elif "afternoon" in lower:
+            slots = [slot for slot in slots if slot["start_time"] >= "12:00"] or slots
+
+        slot_lines = [
+            f"Slot {slot['slot_id']}: {slot['start_time']} - {slot['end_time']}"
+            for slot in slots[:6]
+        ]
+        return (
+            f"Available slots for {doctor_name} on {date_str}:\n"
+            + "\n".join(slot_lines)
+            + "\nReply with a slot number like 'Book slot 10' or a time like 'Book the 9:00 AM slot'.",
+            tool_calls,
+        )
+
     return (
-        "I can help you check doctor availability and book appointments. "
-        "Try: 'Check Dr. Ahuja's availability for tomorrow' or 'Book an appointment with Dr. Ahuja tomorrow morning'.",
+        "I can help you check availability, book an appointment, and generate doctor summaries. "
+        "Try 'Show Dr. Ahuja availability for tomorrow morning' or 'Book slot 10'.",
         [],
     )
 
@@ -256,7 +369,7 @@ def _openai_response(messages: list, db=None) -> tuple[str, list]:
             for tc in msg.tool_calls:
                 name = tc.function.name
                 args = json.loads(tc.function.arguments)
-                result = _call_tool(name, args)
+                result = _call_tool(name, args, db)
                 tool_calls_made.append({"tool": name, "arguments": args, "result": result})
                 msgs.append({
                     "role": "tool",
@@ -309,7 +422,7 @@ def _anthropic_response(messages: list, db=None) -> tuple[str, list]:
             name = getattr(block, "name", None)
             if name:
                 args = getattr(block, "input", {}) or {}
-                result = _call_tool(name, args)
+                result = _call_tool(name, args, db)
                 tool_calls_made.append({"tool": name, "arguments": args, "result": result})
                 msgs.append({
                     "role": "user",

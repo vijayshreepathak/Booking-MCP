@@ -1,131 +1,375 @@
 # Agentic Appointment MCP
 
-A minimal full-stack demo implementing **Agentic AI with MCP** (Model Context Protocol). Allows patients to schedule doctor appointments via natural language and doctors to get smart summary reports. Uses FastAPI (backend), React (frontend), PostgreSQL, and MCP tools that an LLM agent can discover and invoke.
+Production-style full-stack demo for the **Full-Stack Developer Intern Assignment – Agentic AI with MCP**. The app lets:
 
-## Quick Start
+- patients discover doctor availability and book appointments through natural language
+- doctors request smart schedule summaries and receive notifications
+- an LLM agent discover backend capabilities dynamically through an MCP-style tool registry
 
-### With Docker (Recommended)
+GitHub repository: [vijayshreepathak/Booking-MCP](https://github.com/vijayshreepathak/Booking-MCP)
 
-```bash
-docker-compose up
+## Assignment Coverage
+
+### Core requirements covered
+
+- FastAPI backend with MCP registry and tool-call endpoints
+- React frontend for patient chat and doctor dashboard
+- PostgreSQL-backed scheduling and appointment data
+- Multi-turn continuity using `Session` and `PromptHistory`
+- Tool discovery via `GET /mcp/tools`
+- Tool invocation via `POST /mcp/tools/{tool_name}/call`
+- Booking flow with calendar + email integration wrappers
+- Doctor reporting flow with alternate notification channel
+- Dockerized local run with seeded data
+- Automated tests for booking flow
+
+### Bonus features covered
+
+- Simple role-based login: patient vs doctor
+- Prompt history tracking and restore on refresh
+- Auto-rescheduling suggestions when a requested slot is unavailable
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[User]
+    F[React Frontend]
+    B[FastAPI Backend]
+    M[MCP Registry]
+    A[Agent Orchestrator]
+    T1[check_availability]
+    T2[create_appointment]
+    T3[query_stats]
+    T4[send_notification]
+    DB[(PostgreSQL)]
+    GC[Google Calendar Wrapper]
+    EM[Email Wrapper]
+    NF[Slack / In-App Notification]
+
+    U --> F
+    F --> B
+    B --> M
+    B --> A
+    A --> T1
+    A --> T2
+    A --> T3
+    A --> T4
+    T1 --> DB
+    T2 --> DB
+    T2 --> GC
+    T2 --> EM
+    T3 --> DB
+    T4 --> NF
 ```
 
-- **Backend**: http://localhost:8000  
-- **Frontend**: http://localhost:3000  
-- **API Docs**: http://localhost:8000/docs  
+## Project Structure
 
-The DB is seeded automatically with 2 doctors (Dr. Ahuja, Dr. Smith) and sample slots.
+```text
+backend/
+  app/
+    main.py
+    tools.py
+    models.py
+    db.py
+    calendar_integration.py
+    email_integration.py
+    mcp_registry.py
+    llm_orchestrator.py
+  alembic/
+  scripts/
+    seed_db.py
+    run_agent_demo.py
+  tests/
+frontend/
+  src/
+    App.jsx
+    api.js
+    components/
+      Chat.jsx
+      DoctorDashboard.jsx
+docker-compose.yml
+.env.example
+README.md
+```
 
-### Local Setup
+## How It Works
 
-1. **PostgreSQL**  
-   Create a database:
-   ```bash
-   createdb appointment_db
-   ```
+### Scenario 1: Patient appointment scheduling
 
-2. **Backend**
-   ```bash
-   cd backend
-   pip install -r requirements.txt
-   cp ../.env.example ../.env   # optional
-   python scripts/seed_db.py
-   uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-   ```
+1. Patient signs in with the patient demo account.
+2. Patient asks: `I want to book an appointment with Dr. Ahuja tomorrow morning`
+3. Agent logic:
+   - interprets the request
+   - calls `check_availability`
+   - returns available slots in chat and as clickable cards
+4. Patient follows up with:
+   - `Book slot 10`
+   - or `Book the 9:00 AM slot`
+5. Agent logic:
+   - calls `create_appointment`
+   - writes appointment to DB
+   - creates a Google Calendar event through the wrapper
+   - sends email through the wrapper
+   - returns a confirmation card in the UI
+6. If the slot is unavailable, the backend returns alternative slots and the UI presents them as rescheduling options.
 
-3. **Frontend**
-   ```bash
-   cd frontend
-   npm install
-   npm run dev
-   ```
-   Frontend: http://localhost:5173
+### Scenario 2: Doctor summary report
 
-4. **Run agent demo script**
-   ```bash
-   cd backend
-   python scripts/run_agent_demo.py
-   ```
+1. Doctor signs in with the doctor demo account.
+2. Doctor opens the dashboard or enters a prompt like:
+   - `How many patients visited yesterday?`
+   - `How many appointments do I have today, tomorrow`
+   - `How many patient with fever`
+3. Backend calls `query_stats`
+4. Backend formats a readable report and sends it through `send_notification`
+5. If Slack is not configured, the report is stored as an in-app notification
 
-## Sample Prompts
+## MCP Interface
 
-### Scenario 1: Patient Appointment Scheduling
+### Tool registry
 
-Copy and paste into the **Patient Chat**:
+- `GET /mcp/tools`
 
-1. **Check availability**
-   - *"I want to check Dr. Ahuja's availability for tomorrow afternoon"*
-   - *"I want to book an appointment with Dr. Ahuja tomorrow morning"*
+Returns metadata for every tool:
 
-2. **Book a slot** (after availability is shown)
-   - *"Please book slot 1"*
-   - *"Book the 9:00 AM slot for John Doe, john@example.com"*
+- tool name
+- description
+- input schema
+- output schema
+- call URL
 
-**Expected output (demo mode):**
-- First message: List of available slots with slot IDs and times
-- Second message: Confirmation with doctor, date, time, and email sent
+### Tool call endpoint
 
-### Scenario 2: Doctor Summary Report
+- `POST /mcp/tools/{tool_name}/call`
 
-1. Go to **Doctor Dashboard**
-2. Enter doctor name (e.g., `Dr. Ahuja`)
-3. Optional prompt: *"How many patients visited yesterday? Summarize today and tomorrow."*
-4. Click **Get summary**
+Supported tools:
 
-**Expected output:**
-- Report with today, yesterday, tomorrow appointment counts
-- Stats displayed in bullet format
+| Tool | Purpose |
+|---|---|
+| `check_availability` | Return available slots for a doctor/date |
+| `create_appointment` | Book appointment atomically and trigger integrations |
+| `query_stats` | Return doctor stats between dates with optional symptom filter |
+| `send_notification` | Send Slack webhook or store in-app notification |
 
 ## API Overview
 
 | Endpoint | Description |
-|----------|-------------|
-| `GET /mcp/tools` | List MCP tools (metadata, schemas, call URLs) |
-| `POST /mcp/tools/{tool_name}/call` | Invoke a tool (e.g. `check_availability`, `create_appointment`) |
-| `POST /api/sessions` | Create session (returns `session_id`) |
-| `POST /api/chat` | Multi-turn chat with LLM/tools |
-| `POST /api/doctor/summary` | Doctor summary report |
+|---|---|
+| `POST /api/auth/login` | Demo role-based login for patient or doctor |
+| `POST /api/sessions` | Create a session |
+| `GET /api/sessions/{session_id}/history` | Load full conversation history |
+| `POST /api/chat` | Multi-turn patient chat endpoint |
+| `POST /api/doctor/summary` | Doctor dashboard summary endpoint |
+| `GET /mcp/tools` | MCP registry metadata |
+| `POST /mcp/tools/{tool_name}/call` | Tool execution endpoint |
+| `GET /health` | Health check |
 
-## MCP Tools
+## Demo Credentials
 
-| Tool | Description |
-|------|-------------|
-| `check_availability` | Query DB for available slots by doctor and date |
-| `create_appointment` | Atomic booking + Google Calendar + email confirmation |
-| `query_stats` | Stats between dates with optional symptom filter |
-| `send_notification` | Slack webhook or in-app notification |
+### Patient
+
+- email: `patient@demo.local`
+- password: `patient123`
+
+### Doctor
+
+- email: `doctor@demo.local`
+- password: `doctor123`
+
+You can override these through `.env`.
+
+## Running the Project
+
+### Docker run
+
+```bash
+docker-compose up --build
+```
+
+Available URLs:
+
+- Frontend: [http://localhost:3000](http://localhost:3000)
+- Backend: [http://localhost:8000](http://localhost:8000)
+- Swagger docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+The backend seeds 2 doctors and sample slots automatically.
+
+### Local run
+
+#### 1. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+#### 2. Start PostgreSQL
+
+Create a DB named `appointment_db`, then export:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/appointment_db
+```
+
+#### 3. Run backend
+
+```bash
+cd backend
+pip install -r requirements.txt
+python scripts/seed_db.py
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+#### 4. Run frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+## Agent Demo Script
+
+Run:
+
+```bash
+cd backend
+python scripts/run_agent_demo.py
+```
+
+The script:
+
+- fetches `GET /mcp/tools`
+- builds a system prompt
+- sends the example booking request
+- handles tool calls
+- prints final output
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set:
+Copy `.env.example` to `.env`.
 
-| Variable | Description |
-|----------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `LLM_PROVIDER` | `demo` (default), `openai`, `anthropic`, `local` |
-| `OPENAI_API_KEY` | For OpenAI |
-| `ANTHROPIC_API_KEY` | For Claude |
-| `GOOGLE_CALENDAR_CREDENTIALS_PATH` | Path to OAuth credentials (optional) |
-| `GOOGLE_CALENDAR_ID` | Calendar ID (default: `primary`) |
-| `SENDGRID_API_KEY` | For email (optional; demo mode if missing) |
-| `SENDGRID_FROM_EMAIL` | Sender email |
-| `SLACK_WEBHOOK_URL` | For notifications (optional; in-app if missing) |
-| `BASE_URL` | Backend URL (default: http://localhost:8000) |
+### Always useful
 
-**Demo mode:** Without external credentials, Google Calendar, SendGrid, and Slack calls are stubbed. MCP tools remain fully functional; data is stored in the DB.
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Database connection string |
+| `BASE_URL` | Backend URL used in MCP call metadata |
+| `LLM_PROVIDER` | `demo`, `openai`, `anthropic`, or `local` |
 
-## Testing
+### Demo login
+
+| Variable | Purpose |
+|---|---|
+| `DEMO_PATIENT_EMAIL` | Demo patient login |
+| `DEMO_PATIENT_PASSWORD` | Demo patient password |
+| `DEMO_PATIENT_NAME` | Demo patient display name |
+| `DEMO_DOCTOR_EMAIL` | Demo doctor login |
+| `DEMO_DOCTOR_PASSWORD` | Demo doctor password |
+| `DEMO_DOCTOR_NAME` | Demo doctor display name |
+
+### Hosted or local LLM
+
+| Variable | Purpose |
+|---|---|
+| `OPENAI_API_KEY` | OpenAI tool-calling |
+| `OPENAI_MODEL` | OpenAI model |
+| `ANTHROPIC_API_KEY` | Claude tool-calling |
+| `ANTHROPIC_MODEL` | Claude model |
+| `LOCAL_LLM_URL` | OpenAI-compatible local endpoint |
+| `LOCAL_MODEL` | Local model name |
+
+### External integrations
+
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_CALENDAR_CREDENTIALS_PATH` | Google auth credentials |
+| `GOOGLE_CALENDAR_ID` | Calendar ID |
+| `SENDGRID_API_KEY` | Email service key |
+| `SENDGRID_FROM_EMAIL` | Outbound email address |
+| `SLACK_WEBHOOK_URL` | Slack notifications |
+
+### What requires your API keys
+
+- No keys are required for the full demo flow
+- Real Google Calendar events require Google credentials
+- Real emails require SendGrid
+- Real Slack notifications require a Slack webhook
+- Real hosted LLM tool-calling requires OpenAI or Anthropic credentials
+
+Without those keys, the app gracefully falls back to demo mode and still completes the assignment flow.
+
+## Sample Test Prompts
+
+### Patient flow
+
+- `I want to book an appointment with Dr. Ahuja tomorrow morning`
+- `Check Dr. Ahuja availability for Friday afternoon`
+- `Please book the 3 PM slot`
+- `Book slot 10`
+
+### Doctor flow
+
+- `How many patients visited yesterday?`
+- `How many appointments do I have today, tomorrow`
+- `How many patient with fever`
+
+## Testing and Verification
+
+### Backend tests
 
 ```bash
 cd backend
 pytest tests/ -v
 ```
 
-## Architecture Notes
+### Frontend build
 
-- **MCP approach:** Custom registry (no `fastapi_mcp`); tools defined in `mcp_registry.py`, invoked at `POST /mcp/tools/{name}/call`.
-- **Multi-turn:** Session + PromptHistory tables persist conversation; last N messages sent as context to the LLM.
-- **Agent demo:** `scripts/run_agent_demo.py` discovers tools from `GET /mcp/tools`, sends a user message, and handles tool calls (OpenAI/Claude or demo mode).
+```bash
+cd frontend
+npm run build
+```
+
+### What is verified
+
+- booking success
+- double-booking prevention
+- alternative slot suggestions
+- stats query
+- demo login endpoint
+- Dockerized frontend/backend startup
+- patient multi-turn history restore
+
+## Notes on Production Readiness
+
+This submission is still a demo, but it includes several production-style practices:
+
+- modular backend structure
+- clear MCP tool boundaries
+- graceful fallback integrations
+- structured API responses
+- session and prompt history persistence
+- Dockerized deployment
+- automated tests
+
+For a true production rollout, the next steps would be:
+
+- JWT/session auth with hashed passwords
+- proper migrations in deployment pipeline
+- audit logging
+- secrets management
+- background job queue for email/calendar/notification retries
+- observability and error reporting
+
+## GitHub Push
+
+Target repository: [vijayshreepathak/Booking-MCP](https://github.com/vijayshreepathak/Booking-MCP)
+
+```bash
+git remote add origin https://github.com/vijayshreepathak/Booking-MCP.git
+git branch -M main
+git push -u origin main
+```
 
 ## License
 

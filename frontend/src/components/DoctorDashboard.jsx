@@ -21,50 +21,78 @@ export default function DoctorDashboard() {
   };
 
   return (
-    <div>
-      <div style={{ marginBottom: 16 }}>
-        <label style={{ display: "block", marginBottom: 4 }}>Doctor Name</label>
-        <input
-          type="text"
-          value={doctorName}
-          onChange={(e) => setDoctorName(e.target.value)}
-          style={{ padding: 8, width: 200 }}
-        />
-      </div>
-      <div style={{ marginBottom: 16 }}>
-        <label style={{ display: "block", marginBottom: 4 }}>Prompt (optional)</label>
-        <input
-          type="text"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          style={{ padding: 8, width: "100%", maxWidth: 400 }}
-        />
-      </div>
-      <button
-        onClick={handleGetSummary}
-        disabled={loading}
-        style={{ padding: "10px 20px", marginBottom: 16 }}
-      >
-        Get summary
-      </button>
-      {loading && <p>Loading...</p>}
+    <div className="dashboard-shell">
+      <section className="panel-card">
+        <div className="panel-header">
+          <div>
+            <h2>Doctor Dashboard</h2>
+            <p>Generate schedule summaries and verify doctor notifications.</p>
+          </div>
+        </div>
+
+        <div className="dashboard-form">
+          <div>
+            <label className="field-label">Doctor name</label>
+            <input
+              type="text"
+              value={doctorName}
+              onChange={(e) => setDoctorName(e.target.value)}
+              className="text-input"
+            />
+          </div>
+
+          <div>
+            <label className="field-label">Prompt</label>
+            <input
+              type="text"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              className="text-input"
+            />
+          </div>
+
+          <button onClick={handleGetSummary} disabled={loading} className="primary-button">
+            {loading ? "Generating..." : "Get summary"}
+          </button>
+        </div>
+      </section>
+
       {report && (
-        <div
-          style={{
-            border: "1px solid #ccc",
-            borderRadius: 8,
-            padding: 16,
-            backgroundColor: "#f9f9f9",
-          }}
-        >
-          <h3>Report for {report.doctor_name}</h3>
-          <pre style={{ whiteSpace: "pre-wrap" }}>{report.report}</pre>
-          {report.stats && (
-            <div style={{ marginTop: 12, fontSize: 14 }}>
-              Stats: Today {report.stats.today}, Yesterday {report.stats.yesterday}, Tomorrow{" "}
-              {report.stats.tomorrow}
+        <div className="dashboard-grid">
+          <section className="panel-card">
+            <h3>Daily metrics</h3>
+            <div className="metric-grid">
+              <div className="metric-card">
+                <span>Today</span>
+                <strong>{report.stats?.today ?? 0}</strong>
+              </div>
+              <div className="metric-card">
+                <span>Yesterday</span>
+                <strong>{report.stats?.yesterday ?? 0}</strong>
+              </div>
+              <div className="metric-card">
+                <span>Tomorrow</span>
+                <strong>{report.stats?.tomorrow ?? 0}</strong>
+              </div>
             </div>
-          )}
+          </section>
+
+          <section className="panel-card">
+            <h3>Summary report</h3>
+            <pre className="report-box">{report.report}</pre>
+          </section>
+
+          <section className="panel-card">
+            <h3>Notification status</h3>
+            <div className="notification-card">
+              <span>Channel</span>
+              <strong>{report.notification?.channel || "n/a"}</strong>
+              <span>Recipient</span>
+              <strong>{report.notification?.recipient || doctorName}</strong>
+              <span>Status</span>
+              <strong>{report.notification?.success ? "Delivered" : "Pending"}</strong>
+            </div>
+          </section>
         </div>
       )}
     </div>

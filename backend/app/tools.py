@@ -1,12 +1,10 @@
-"""MCP tool definitions: check_availability, create_appointment, query_stats, send_notification."""
-import json
-from datetime import datetime, date, time, timedelta
+"""MCP tool implementations used by the registry and chat flow."""
+from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func
 
-from app.models import Doctor, DoctorSlot, Patient, Appointment, InAppNotification
+from app.models import Appointment, Doctor, DoctorSlot, InAppNotification, Patient
 from app.calendar_integration import add_event_to_calendar
 from app.email_integration import send_confirmation
 
@@ -29,12 +27,11 @@ def check_availability(
     if not doctor:
         return {"available_slots": [], "error": f"Doctor '{doctor_name}' not found."}
 
-    # Slots that have no linked appointment
     available = []
     for slot in db.query(DoctorSlot).filter(
         DoctorSlot.doctor_id == doctor.id,
         DoctorSlot.date == slot_date,
-        DoctorSlot.is_available == True,
+        DoctorSlot.is_available.is_(True),
     ).all():
         has_appt = db.query(Appointment).filter(Appointment.slot_id == slot.id).first()
         if not has_appt:
@@ -45,6 +42,51 @@ def check_availability(
                 "date": slot.date.strftime("%Y-%m-%d"),
             })
     return {"available_slots": available, "doctor": doctor.name}
+
+
+def find_next_available_slots(
+    db: Session,
+    doctor_name: str,
+    start_date: str,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Return the next available slots for a doctor from a given date onward."""
+    try:
+        from_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+    except ValueError:
+        from_date = datetime.utcnow().date()
+
+    doctor = db.query(Doctor).filter(Doctor.name.ilike(f"%{doctor_name}%")).first()
+    if not doctor:
+        return []
+
+    slots = (
+        db.query(DoctorSlot)
+        .filter(
+            DoctorSlot.doctor_id == doctor.id,
+            DoctorSlot.date >= from_date,
+            DoctorSlot.is_available.is_(True),
+        )
+        .order_by(DoctorSlot.date.asc(), DoctorSlot.start_time.asc())
+        .all()
+    )
+
+    alternatives = []
+    for slot in slots:
+        has_appt = db.query(Appointment).filter(Appointment.slot_id == slot.id).first()
+        if has_appt:
+            continue
+        alternatives.append(
+            {
+                "slot_id": slot.id,
+                "date": slot.date.strftime("%Y-%m-%d"),
+                "start_time": slot.start_time.strftime("%H:%M"),
+                "end_time": slot.end_time.strftime("%H:%M"),
+            }
+        )
+        if len(alternatives) >= limit:
+            break
+    return alternatives
 
 
 def create_appointment(
@@ -65,99 +107,112 @@ def create_appointment(
     if not doctor:
         return {"success": False, "error": f"Doctor '{doctor_name}' not found."}
 
+    if not patient_email:
+        return {"success": False, "error": "Patient email is required to confirm the booking."}
+
     patient = db.query(Patient).filter(Patient.email == patient_email).first()
     if not patient:
-        patient = Patient(name=patient_name, email=patient_email)
+        patient = Patient(name=patient_name or "Guest Patient", email=patient_email)
         db.add(patient)
         db.flush()
 
     slot = None
-    if slot_id:
+    if slot_id is not None:
         slot = db.query(DoctorSlot).filter(
             DoctorSlot.id == slot_id,
             DoctorSlot.doctor_id == doctor.id,
-            DoctorSlot.is_available == True,
         ).first()
         if not slot:
-            existing = db.query(Appointment).filter(Appointment.slot_id == slot_id).first()
-            if existing:
-                return {"success": False, "error": "Slot is already booked."}
-            slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).first()
-            if not slot:
-                return {"success": False, "error": f"Slot {slot_id} not found."}
-
-    if not slot and date_str and start_time_str:
+            return {
+                "success": False,
+                "error": f"Slot {slot_id} not found for {doctor.name}.",
+                "alternative_slots": find_next_available_slots(
+                    db,
+                    doctor.name,
+                    datetime.utcnow().strftime("%Y-%m-%d"),
+                ),
+            }
+    elif date_str and start_time_str:
         try:
             appt_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             start_t = datetime.strptime(start_time_str, "%H:%M").time()
         except ValueError:
             return {"success": False, "error": "Invalid date or time format."}
+
         slot = db.query(DoctorSlot).filter(
             DoctorSlot.doctor_id == doctor.id,
             DoctorSlot.date == appt_date,
             DoctorSlot.start_time == start_t,
-            DoctorSlot.is_available == True,
         ).first()
         if not slot:
-            # Create ad-hoc slot for flexibility
-            from datetime import time as dt_time
-            end_t = (datetime.combine(date(1, 1, 1), start_t) + timedelta(minutes=30)).time()
-            slot = DoctorSlot(
-                doctor_id=doctor.id,
-                date=appt_date,
-                start_time=start_t,
-                end_time=end_t,
-                is_available=True,
-            )
-            db.add(slot)
-            db.flush()
-
-    if not slot:
+            return {
+                "success": False,
+                "error": "The requested slot does not exist.",
+                "alternative_slots": find_next_available_slots(db, doctor.name, date_str),
+            }
+    else:
         return {"success": False, "error": "Provide slot_id or date_str and start_time_str."}
 
-    # Check not already booked
     existing = db.query(Appointment).filter(Appointment.slot_id == slot.id).first()
-    if existing:
-        return {"success": False, "error": "Slot is already booked."}
+    if existing or not slot.is_available:
+        return {
+            "success": False,
+            "error": "Slot is already booked.",
+            "alternative_slots": find_next_available_slots(
+                db,
+                doctor.name,
+                slot.date.strftime("%Y-%m-%d"),
+            ),
+        }
 
-    start_dt = datetime.combine(slot.date, slot.start_time)
-    end_dt = datetime.combine(slot.date, slot.end_time)
-    calendar_event_id = add_event_to_calendar(
-        doctor_name=doctor.name,
-        patient_name=patient.name,
-        patient_email=patient.email,
-        start_datetime=start_dt,
-        end_datetime=end_dt,
-    )
-    email_sent = send_confirmation(
-        to_email=patient.email,
-        patient_name=patient.name,
-        doctor_name=doctor.name,
-        appointment_date=slot.date.strftime("%Y-%m-%d"),
-        start_time=slot.start_time.strftime("%H:%M"),
-    )
-    appointment = Appointment(
-        doctor_id=doctor.id,
-        patient_id=patient.id,
-        slot_id=slot.id,
-        appointment_date=slot.date,
-        start_time=slot.start_time,
-        symptom=symptom,
-        status="confirmed",
-        calendar_event_id=calendar_event_id,
-    )
-    db.add(appointment)
-    db.commit()
-    db.refresh(appointment)
+    try:
+        slot.is_available = False
+        start_dt = datetime.combine(slot.date, slot.start_time)
+        end_dt = datetime.combine(slot.date, slot.end_time)
+        calendar_event_id = add_event_to_calendar(
+            doctor_name=doctor.name,
+            patient_name=patient.name,
+            patient_email=patient.email,
+            start_datetime=start_dt,
+            end_datetime=end_dt,
+        )
+        email_sent = send_confirmation(
+            to_email=patient.email,
+            patient_name=patient.name,
+            doctor_name=doctor.name,
+            appointment_date=slot.date.strftime("%Y-%m-%d"),
+            start_time=slot.start_time.strftime("%H:%M"),
+        )
+        appointment = Appointment(
+            doctor_id=doctor.id,
+            patient_id=patient.id,
+            slot_id=slot.id,
+            appointment_date=slot.date,
+            start_time=slot.start_time,
+            symptom=symptom,
+            status="confirmed",
+            calendar_event_id=calendar_event_id,
+        )
+        db.add(appointment)
+        db.commit()
+        db.refresh(appointment)
+    except Exception as exc:
+        db.rollback()
+        return {"success": False, "error": f"Booking failed: {exc}"}
+
     return {
         "success": True,
         "appointment_id": appointment.id,
         "doctor": doctor.name,
         "patient": patient.name,
+        "patient_email": patient.email,
         "date": slot.date.strftime("%Y-%m-%d"),
         "start_time": slot.start_time.strftime("%H:%M"),
+        "end_time": slot.end_time.strftime("%H:%M"),
         "calendar_event_id": calendar_event_id,
         "email_sent": email_sent,
+        "message": "Appointment booked successfully.",
+        "alternative_slots": [],
     }
 
 
@@ -193,13 +248,17 @@ def query_stats(
     appointments = q.all()
     total = len(appointments)
     by_date = {}
+    symptoms = {}
     for a in appointments:
-        k = a.appointment_date.strftime("%Y-%m-%d")
-        by_date[k] = by_date.get(k, 0) + 1
+        date_key = a.appointment_date.strftime("%Y-%m-%d")
+        by_date[date_key] = by_date.get(date_key, 0) + 1
+        symptom_key = a.symptom or "general"
+        symptoms[symptom_key] = symptoms.get(symptom_key, 0) + 1
     return {
         "total_appointments": total,
         "by_date": by_date,
         "symptom_filter": symptom_filter,
+        "symptoms": symptoms,
     }
 
 
@@ -215,8 +274,10 @@ def send_notification(
     import os
     import httpx
     webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-    if webhook_url and not webhook_url.startswith("https://hooks.slack.com"):
+    if channel != "slack":
         webhook_url = None  # placeholder
+    if webhook_url and not webhook_url.startswith("https://hooks.slack.com"):
+        webhook_url = None
     if webhook_url:
         try:
             resp = httpx.post(
@@ -232,4 +293,10 @@ def send_notification(
     notif = InAppNotification(recipient=recipient, message=message)
     db.add(notif)
     db.commit()
-    return {"success": True, "channel": "in_app", "notification_id": notif.id}
+    return {
+        "success": True,
+        "channel": "in_app",
+        "notification_id": notif.id,
+        "recipient": recipient,
+        "message": message,
+    }

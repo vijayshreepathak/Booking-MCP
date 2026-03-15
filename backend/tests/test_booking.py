@@ -5,6 +5,7 @@ import os
 import pytest
 from datetime import date, time
 from unittest.mock import patch
+from fastapi.testclient import TestClient
 
 # Use SQLite for tests
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
@@ -14,6 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app.models import Doctor, DoctorSlot, Patient, Appointment
 from app.tools import check_availability, create_appointment, query_stats
+from app.main import app
 
 
 @pytest.fixture
@@ -104,3 +106,45 @@ def test_query_stats(seeded_db):
     )
     assert "total_appointments" in result
     assert "by_date" in result
+
+
+@patch("app.tools.add_event_to_calendar", return_value="demo_event_123")
+@patch("app.tools.send_confirmation", return_value=True)
+def test_create_appointment_returns_alternatives_when_booked(mock_email, mock_calendar, seeded_db):
+    slots = check_availability(seeded_db, "Dr. Ahuja", "2025-03-16")
+    slot_id = slots["available_slots"][0]["slot_id"]
+
+    create_appointment(
+        seeded_db,
+        doctor_name="Dr. Ahuja",
+        patient_name="Patient 1",
+        patient_email="p1@example.com",
+        slot_id=slot_id,
+    )
+    result = create_appointment(
+        seeded_db,
+        doctor_name="Dr. Ahuja",
+        patient_name="Patient 2",
+        patient_email="p2@example.com",
+        slot_id=slot_id,
+    )
+
+    assert result["success"] is False
+    assert "alternative_slots" in result
+
+
+def test_demo_login_endpoint():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/auth/login",
+            json={
+                "role": "patient",
+                "email": "patient@demo.local",
+                "password": "patient123",
+                "name": "Demo Patient",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["role"] == "patient"
+        assert data["email"] == "patient@demo.local"

@@ -15,11 +15,35 @@ export async function createSession() {
   return data.session_id;
 }
 
-export async function sendChat(sessionId, message) {
+export async function login(credentials) {
+  const res = await fetch(`${API_BASE}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(credentials),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Login failed" }));
+    throw new Error(error.detail || "Login failed");
+  }
+  return res.json();
+}
+
+export async function getSessionHistory(sessionId) {
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/history`);
+  if (!res.ok) throw new Error("Failed to load session history");
+  return res.json();
+}
+
+export async function sendChat(sessionId, message, patientProfile = {}) {
   const res = await fetch(`${API_BASE}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, message }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      message,
+      patient_name: patientProfile.patientName || undefined,
+      patient_email: patientProfile.patientEmail || undefined,
+    }),
   });
   if (!res.ok) throw new Error("Chat request failed");
   return res.json();
