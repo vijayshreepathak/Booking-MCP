@@ -1,10 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
-import { getSessionHistory, sendChat } from "../api";
+import {
+  deletePatientAppointment,
+  getDoctors,
+  getPatientAppointments,
+  getSessionHistory,
+  reschedulePatientAppointment,
+  sendChat,
+} from "../api";
 
 export default function Chat({ sessionId, sessionLabel }) {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [doctors, setDoctors] = useState([]);
+  const [appointments, setAppointments] = useState([]);
+  const [appointmentsLoading, setAppointmentsLoading] = useState(false);
+  const [selectedDoctor, setSelectedDoctor] = useState(
+    localStorage.getItem("appointment_selected_doctor") || "Dr. Ahuja"
+  );
+  const [selectedDate, setSelectedDate] = useState(
+    new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+  );
+  const [activeAppointmentId, setActiveAppointmentId] = useState(null);
+  const [rescheduleTarget, setRescheduleTarget] = useState(null);
   const [patientName, setPatientName] = useState(
     localStorage.getItem("appointment_patient_name") || "Vijayshree"
   );
@@ -14,12 +32,28 @@ export default function Chat({ sessionId, sessionLabel }) {
 
   const quickPrompts = useMemo(
     () => [
-      "Show Dr. Ahuja availability for tomorrow morning",
+      `Show ${selectedDoctor} availability for tomorrow morning`,
       "Book slot 10",
-      "Book the 9:00 AM slot",
+      "Move appointment 1 to slot 10",
     ],
-    []
+    [selectedDoctor]
   );
+
+  async function loadAppointments(email) {
+    if (!email) {
+      setAppointments([]);
+      return;
+    }
+    setAppointmentsLoading(true);
+    try {
+      const data = await getPatientAppointments(email);
+      setAppointments(data.appointments || []);
+    } catch {
+      setAppointments([]);
+    } finally {
+      setAppointmentsLoading(false);
+    }
+  }
 
   useEffect(() => {
     let ignore = false;
@@ -50,9 +84,48 @@ export default function Chat({ sessionId, sessionLabel }) {
     };
   }, [sessionId]);
 
-  const handleSend = async () => {
-    if (!message.trim() || loading) return;
-    const userMsg = message.trim();
+  useEffect(() => {
+    let ignore = false;
+    async function loadDoctors() {
+      try {
+        const data = await getDoctors();
+        if (!ignore) {
+          setDoctors(data.doctors || []);
+          if (!localStorage.getItem("appointment_selected_doctor") && data.doctors?.[0]?.name) {
+            setSelectedDoctor(data.doctors[0].name);
+          }
+        }
+      } catch {
+        if (!ignore) {
+          setDoctors([]);
+        }
+      }
+    }
+    loadDoctors();
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    loadAppointments(patientEmail);
+  }, [patientEmail]);
+
+  const addAssistantMessage = (content, appointment = null, alternativeSlots = []) => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content,
+        appointment,
+        alternativeSlots,
+      },
+    ]);
+  };
+
+  const submitMessage = async (text) => {
+    if (!text.trim() || loading) return;
+    const userMsg = text.trim();
     setMessage("");
     setMessages((prev) => [...prev, { role: "user", content: userMsg }]);
     setLoading(true);
@@ -60,6 +133,7 @@ export default function Chat({ sessionId, sessionLabel }) {
     try {
       localStorage.setItem("appointment_patient_name", patientName);
       localStorage.setItem("appointment_patient_email", patientEmail);
+      localStorage.setItem("appointment_selected_doctor", selectedDoctor);
       const res = await sendChat(sessionId, userMsg, { patientName, patientEmail });
       setMessages((prev) => [
         ...prev,
@@ -72,6 +146,7 @@ export default function Chat({ sessionId, sessionLabel }) {
           appointment: res.appointment || null,
         },
       ]);
+      await loadAppointments(patientEmail);
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -79,6 +154,60 @@ export default function Chat({ sessionId, sessionLabel }) {
       ]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSend = async () => {
+    await submitMessage(message);
+  };
+
+  const handleCheckAvailability = async () => {
+    const prompt = `Show ${selectedDoctor} availability for ${selectedDate}`;
+    await submitMessage(prompt);
+  };
+
+  const handleDeleteAppointment = async (appointmentId) => {
+    if (!window.confirm("Delete this appointment?")) return;
+    setActiveAppointmentId(appointmentId);
+    try {
+      const result = await deletePatientAppointment(appointmentId, patientEmail);
+      addAssistantMessage(
+        result.message || "Appointment deleted successfully.",
+        result.appointment || null
+      );
+      setRescheduleTarget(null);
+      await loadAppointments(patientEmail);
+    } catch (error) {
+      addAssistantMessage("Error: " + error.message);
+    } finally {
+      setActiveAppointmentId(null);
+    }
+  };
+
+  const handlePickSlot = async (slot) => {
+    if (!rescheduleTarget) {
+      setMessage(`Book slot ${slot.slot_id}`);
+      return;
+    }
+
+    setActiveAppointmentId(rescheduleTarget.appointment_id);
+    try {
+      const result = await reschedulePatientAppointment(rescheduleTarget.appointment_id, {
+        patient_email: patientEmail,
+        doctor_name: slot.doctor,
+        new_slot_id: slot.slot_id,
+      });
+      addAssistantMessage(
+        result.message || "Appointment updated successfully.",
+        result.appointment || null,
+        result.alternative_slots || []
+      );
+      setRescheduleTarget(null);
+      await loadAppointments(patientEmail);
+    } catch (error) {
+      addAssistantMessage("Error: " + error.message);
+    } finally {
+      setActiveAppointmentId(null);
     }
   };
 
@@ -102,6 +231,55 @@ export default function Chat({ sessionId, sessionLabel }) {
           placeholder="Enter patient email"
         />
 
+        <label className="field-label">Choose doctor</label>
+        <select
+          className="text-input"
+          value={selectedDoctor}
+          onChange={(e) => {
+            setSelectedDoctor(e.target.value);
+            localStorage.setItem("appointment_selected_doctor", e.target.value);
+          }}
+        >
+          {doctors.map((doctor) => (
+            <option key={doctor.doctor_id} value={doctor.name}>
+              {doctor.name} - {doctor.specialization}
+            </option>
+          ))}
+        </select>
+
+        <label className="field-label">Check date</label>
+        <input
+          type="date"
+          className="text-input"
+          value={selectedDate}
+          onChange={(e) => setSelectedDate(e.target.value)}
+        />
+
+        <button type="button" className="primary-button secondary-button" onClick={handleCheckAvailability}>
+          Show slots
+        </button>
+
+        <div className="helper-card">
+          <strong>Doctors</strong>
+          <div className="doctor-list">
+            {doctors.map((doctor) => (
+              <button
+                key={doctor.doctor_id}
+                type="button"
+                className={doctor.name === selectedDoctor ? "doctor-card active" : "doctor-card"}
+                onClick={() => {
+                  setSelectedDoctor(doctor.name);
+                  localStorage.setItem("appointment_selected_doctor", doctor.name);
+                }}
+              >
+                <strong>{doctor.name}</strong>
+                <span>{doctor.specialization}</span>
+                <span>{doctor.available_slots} future slots</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="helper-card">
           <strong>Suggested prompts</strong>
           {quickPrompts.map((prompt) => (
@@ -115,16 +293,79 @@ export default function Chat({ sessionId, sessionLabel }) {
             </button>
           ))}
         </div>
+
+        <div className="helper-card">
+          <strong>Your appointments</strong>
+          {appointmentsLoading && <p className="loading-copy">Loading appointments...</p>}
+          {!appointmentsLoading && appointments.length === 0 && (
+            <p className="loading-copy">No active appointments for this email.</p>
+          )}
+          {appointments.map((appointment) => (
+            <div key={appointment.appointment_id} className="patient-appointment-card">
+              <strong>
+                #{appointment.appointment_id} {appointment.doctor}
+              </strong>
+              <span>
+                {appointment.date} {appointment.start_time}
+              </span>
+              <span>Status: {appointment.status}</span>
+              <div className="inline-actions">
+                <button
+                  type="button"
+                  className={
+                    rescheduleTarget?.appointment_id === appointment.appointment_id
+                      ? "quick-prompt active-action"
+                      : "quick-prompt"
+                  }
+                  onClick={() => {
+                    setRescheduleTarget(appointment);
+                    setSelectedDoctor(appointment.doctor);
+                    addAssistantMessage(
+                      `Reschedule mode enabled for appointment ${appointment.appointment_id}. Pick a doctor/date, click Show slots, then choose a new slot card.`
+                    );
+                  }}
+                >
+                  Change
+                </button>
+                <button
+                  type="button"
+                  className="quick-prompt danger-action"
+                  disabled={activeAppointmentId === appointment.appointment_id}
+                  onClick={() => handleDeleteAppointment(appointment.appointment_id)}
+                >
+                  {activeAppointmentId === appointment.appointment_id ? "Deleting..." : "Delete"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
       </aside>
 
       <section className="panel-card">
         <div className="panel-header">
           <div>
             <h2>Patient Assistant</h2>
-            <p>Check availability, then book by slot number or time.</p>
+            <p>Choose any doctor, book new slots, or change/delete your existing appointments.</p>
           </div>
           <span className="session-pill">{sessionLabel || "Session active"}</span>
         </div>
+
+        {rescheduleTarget && (
+          <div className="helper-card">
+            <strong>Rescheduling appointment #{rescheduleTarget.appointment_id}</strong>
+            <p className="loading-copy">
+              Current booking: {rescheduleTarget.doctor} on {rescheduleTarget.date} at{" "}
+              {rescheduleTarget.start_time}. Pick a new slot below or cancel reschedule mode.
+            </p>
+            <button
+              type="button"
+              className="quick-prompt"
+              onClick={() => setRescheduleTarget(null)}
+            >
+              Cancel change mode
+            </button>
+          </div>
+        )}
 
         <div className="chat-window">
           {messages.length === 0 && (
@@ -146,9 +387,10 @@ export default function Chat({ sessionId, sessionLabel }) {
                       key={slot.slot_id}
                       type="button"
                       className="slot-card"
-                      onClick={() => setMessage(`Book slot ${slot.slot_id}`)}
+                      onClick={() => handlePickSlot(slot)}
                     >
                       <strong>Slot {slot.slot_id}</strong>
+                      <span>{slot.doctor}</span>
                       <span>{slot.date}</span>
                       <span>
                         {slot.start_time} - {slot.end_time}
@@ -167,9 +409,10 @@ export default function Chat({ sessionId, sessionLabel }) {
                         key={`alt-${slot.slot_id}`}
                         type="button"
                         className="slot-card"
-                        onClick={() => setMessage(`Book slot ${slot.slot_id}`)}
+                        onClick={() => handlePickSlot(slot)}
                       >
                         <strong>Slot {slot.slot_id}</strong>
+                        <span>{slot.doctor}</span>
                         <span>{slot.date}</span>
                         <span>
                           {slot.start_time} - {slot.end_time}
@@ -182,8 +425,14 @@ export default function Chat({ sessionId, sessionLabel }) {
 
               {m.appointment && (
                 <div className="confirmation-card">
-                  <h3>Appointment confirmed</h3>
+                  <h3>
+                    {m.appointment.status === "cancelled"
+                      ? "Appointment cancelled"
+                      : "Appointment details"}
+                  </h3>
                   <div className="confirmation-grid">
+                    <span>ID</span>
+                    <strong>{m.appointment.appointment_id}</strong>
                     <span>Doctor</span>
                     <strong>{m.appointment.doctor}</strong>
                     <span>Patient</span>
@@ -192,10 +441,13 @@ export default function Chat({ sessionId, sessionLabel }) {
                     <strong>{m.appointment.date}</strong>
                     <span>Time</span>
                     <strong>
-                      {m.appointment.start_time} - {m.appointment.end_time}
+                      {m.appointment.start_time}
+                      {m.appointment.end_time ? ` - ${m.appointment.end_time}` : ""}
                     </strong>
                     <span>Email</span>
                     <strong>{m.appointment.patient_email}</strong>
+                    <span>Status</span>
+                    <strong>{m.appointment.status}</strong>
                   </div>
                 </div>
               )}

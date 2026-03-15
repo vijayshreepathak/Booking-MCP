@@ -26,6 +26,8 @@ GitHub repository: [vijayshreepathak/Booking-MCP](https://github.com/vijayshreep
 ### Bonus features covered
 
 - Simple role-based login: patient vs doctor
+- Multiple doctor selection in the patient flow
+- Patient self-service appointment change and delete actions
 - Prompt history tracking and restore on refresh
 - Auto-rescheduling suggestions when a requested slot is unavailable
 
@@ -98,7 +100,7 @@ README.md
 ### Scenario 1: Patient appointment scheduling
 
 1. Patient signs in with the patient demo account.
-2. Patient asks: `I want to book an appointment with Dr. Ahuja tomorrow morning`
+2. Patient can select from multiple doctors in the sidebar or ask in chat: `I want to book an appointment with Dr. Ahuja tomorrow morning`
 3. Agent logic:
    - interprets the request
    - calls `check_availability`
@@ -112,7 +114,8 @@ README.md
    - creates a Google Calendar event through the wrapper
    - sends email through the wrapper
    - returns a confirmation card in the UI
-6. If the slot is unavailable, the backend returns alternative slots and the UI presents them as rescheduling options.
+6. Patients can review current bookings, change to a different doctor/slot, or delete an appointment directly from the sidebar.
+7. If the slot is unavailable, the backend returns alternative slots and the UI presents them as rescheduling options.
 
 ### Scenario 2: Doctor summary report
 
@@ -147,18 +150,26 @@ Supported tools:
 
 | Tool | Purpose |
 |---|---|
+| `list_doctors` | Return available doctors with specialization and next slot |
 | `check_availability` | Return available slots for a doctor/date |
 | `create_appointment` | Book appointment atomically and trigger integrations |
 | `query_stats` | Return doctor stats between dates with optional symptom filter |
 | `send_notification` | Send Slack webhook or store in-app notification |
+| `list_patient_appointments` | Return current patient bookings |
+| `cancel_appointment` | Cancel a patient booking and free the slot |
+| `reschedule_appointment` | Move a booking to another doctor/slot |
 
 ## API Overview
 
 | Endpoint | Description |
 |---|---|
 | `POST /api/auth/login` | Demo role-based login for patient or doctor |
+| `GET /api/doctors` | List doctors for UI selection |
 | `POST /api/sessions` | Create a session |
 | `GET /api/sessions/{session_id}/history` | Load full conversation history |
+| `GET /api/patient/appointments` | List patient appointments by email |
+| `DELETE /api/patient/appointments/{appointment_id}` | Cancel/delete a patient appointment |
+| `POST /api/patient/appointments/{appointment_id}/reschedule` | Change a patient appointment |
 | `POST /api/chat` | Multi-turn patient chat endpoint |
 | `POST /api/doctor/summary` | Doctor dashboard summary endpoint |
 | `GET /mcp/tools` | MCP registry metadata |
@@ -299,14 +310,35 @@ Copy `.env.example` to `.env`.
 
 Without those keys, the app gracefully falls back to demo mode and still completes the assignment flow.
 
+## Screenshots
+
+### Login Page
+
+![Login Page](backend/Screenshots/LoginPage.png)
+
+### Patient Booking Flow
+
+![Patient Booking Flow](backend/Screenshots/Patient1.png)
+
+### Patient Dashboard With Change/Delete
+
+![Patient Dashboard With Change Delete](backend/Screenshots/PatientDashbard2.png)
+
+### Doctor Dashboard
+
+![Doctor Dashboard](backend/Screenshots/DoctorDashboard.png)
+
 ## Sample Test Prompts
 
 ### Patient flow
 
 - `I want to book an appointment with Dr. Ahuja tomorrow morning`
+- `Show Dr. Smith availability for tomorrow morning`
 - `Check Dr. Ahuja availability for Friday afternoon`
 - `Please book the 3 PM slot`
 - `Book slot 10`
+- `Move appointment 1 to slot 10`
+- `Cancel appointment 1`
 
 ### Doctor flow
 
@@ -332,7 +364,9 @@ npm run build
 
 ### What is verified
 
+- multiple doctor listing and selection
 - booking success
+- patient appointment change and delete flows
 - double-booking prevention
 - alternative slot suggestions
 - stats query

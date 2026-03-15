@@ -50,9 +50,19 @@ def _fetch_tools_metadata() -> list:
 def _call_tool(tool_name: str, arguments: dict, db=None) -> Any:
     if db is not None:
         try:
-            from app.tools import check_availability, create_appointment, query_stats, send_notification
+            from app.tools import (
+                cancel_appointment,
+                check_availability,
+                create_appointment,
+                list_doctors,
+                list_patient_appointments,
+                query_stats,
+                reschedule_appointment,
+                send_notification,
+            )
 
             handlers = {
+                "list_doctors": lambda: list_doctors(db),
                 "check_availability": lambda: check_availability(
                     db, arguments.get("doctor_name", ""), arguments.get("date_str", "")
                 ),
@@ -78,6 +88,24 @@ def _call_tool(tool_name: str, arguments: dict, db=None) -> Any:
                     arguments.get("recipient", ""),
                     arguments.get("message", ""),
                     arguments.get("channel", "slack"),
+                ),
+                "list_patient_appointments": lambda: list_patient_appointments(
+                    db,
+                    arguments.get("patient_email", ""),
+                ),
+                "cancel_appointment": lambda: cancel_appointment(
+                    db,
+                    arguments.get("appointment_id"),
+                    arguments.get("patient_email", ""),
+                ),
+                "reschedule_appointment": lambda: reschedule_appointment(
+                    db,
+                    arguments.get("appointment_id"),
+                    arguments.get("patient_email", ""),
+                    new_slot_id=arguments.get("new_slot_id") or arguments.get("slot_id"),
+                    doctor_name=arguments.get("doctor_name"),
+                    date_str=arguments.get("date_str"),
+                    start_time_str=arguments.get("start_time_str"),
                 ),
             }
             if tool_name in handlers:
@@ -150,6 +178,19 @@ def _extract_slot_id(text: str) -> Optional[int]:
     match = re.search(r"\bslot\s+(\d+)\b", text, re.IGNORECASE)
     if match:
         return int(match.group(1))
+    return None
+
+
+def _extract_appointment_id(text: str) -> Optional[int]:
+    patterns = [
+        r"\bappointment\s+(\d+)\b",
+        r"\bbooking\s+(\d+)\b",
+        r"\bid\s+(\d+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
     return None
 
 
@@ -265,8 +306,75 @@ def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict]
     )
 
     wants_booking = any(word in lower for word in ["book", "schedule", "confirm"])
+    wants_cancel = any(word in lower for word in ["cancel", "delete", "remove"])
+    wants_change = any(word in lower for word in ["reschedule", "change", "move"])
+    wants_doctors = any(word in lower for word in ["doctor options", "available doctors", "list doctors", "which doctors"])
     slot_id = _extract_slot_id(user_content)
+    appointment_id = _extract_appointment_id(user_content)
     time_str = _extract_time(user_content)
+
+    if wants_doctors:
+        doctors_result = _call_tool("list_doctors", {}, db)
+        tool_calls.append(
+            {
+                "tool": "list_doctors",
+                "arguments": {},
+                "result": doctors_result,
+            }
+        )
+        doctors = doctors_result.get("doctors", [])
+        if not doctors:
+            return "No doctors are available right now.", tool_calls
+        lines = [
+            f"{doctor['name']} ({doctor['specialization']})"
+            for doctor in doctors
+        ]
+        return "You can book with:\n" + "\n".join(lines), tool_calls
+
+    if wants_cancel and appointment_id is not None:
+        cancel_args = {
+            "appointment_id": appointment_id,
+            "patient_email": patient_email,
+        }
+        cancel_result = _call_tool("cancel_appointment", cancel_args, db)
+        tool_calls.append(
+            {
+                "tool": "cancel_appointment",
+                "arguments": cancel_args,
+                "result": cancel_result,
+            }
+        )
+        if cancel_result.get("success"):
+            return f"Appointment {appointment_id} has been cancelled.", tool_calls
+        return cancel_result.get("error", "Unable to cancel that appointment."), tool_calls
+
+    if wants_change and appointment_id is not None and (slot_id is not None or time_str):
+        reschedule_args = {
+            "appointment_id": appointment_id,
+            "patient_email": patient_email,
+            "doctor_name": doctor_name,
+        }
+        if slot_id is not None:
+            reschedule_args["new_slot_id"] = slot_id
+        if time_str:
+            reschedule_args["date_str"] = date_str
+            reschedule_args["start_time_str"] = time_str
+        reschedule_result = _call_tool("reschedule_appointment", reschedule_args, db)
+        tool_calls.append(
+            {
+                "tool": "reschedule_appointment",
+                "arguments": reschedule_args,
+                "result": reschedule_result,
+            }
+        )
+        if reschedule_result.get("success"):
+            appointment = reschedule_result["appointment"]
+            return (
+                f"Appointment {appointment['appointment_id']} was moved to "
+                f"{appointment['doctor']} on {appointment['date']} at {appointment['start_time']}.",
+                tool_calls,
+            )
+        return reschedule_result.get("error", "Unable to change that appointment."), tool_calls
 
     if wants_booking and (slot_id is not None or time_str):
         booking_args = {

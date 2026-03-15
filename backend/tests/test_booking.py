@@ -14,7 +14,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db import Base
 from app.models import Doctor, DoctorSlot, Patient, Appointment
-from app.tools import check_availability, create_appointment, query_stats
+from app.tools import (
+    cancel_appointment,
+    check_availability,
+    create_appointment,
+    list_doctors,
+    list_patient_appointments,
+    query_stats,
+    reschedule_appointment,
+)
 from app.main import app
 
 
@@ -31,7 +39,9 @@ def db():
 @pytest.fixture
 def seeded_db(db):
     dr = Doctor(name="Dr. Ahuja", specialization="GP", email="ahuja@test.com")
+    dr2 = Doctor(name="Dr. Smith", specialization="Cardiology", email="smith@test.com")
     db.add(dr)
+    db.add(dr2)
     db.flush()
     slot = DoctorSlot(
         doctor_id=dr.id,
@@ -41,6 +51,24 @@ def seeded_db(db):
         is_available=True,
     )
     db.add(slot)
+    db.add(
+        DoctorSlot(
+            doctor_id=dr.id,
+            date=date(2025, 3, 16),
+            start_time=time(10, 0),
+            end_time=time(10, 30),
+            is_available=True,
+        )
+    )
+    db.add(
+        DoctorSlot(
+            doctor_id=dr2.id,
+            date=date(2025, 3, 16),
+            start_time=time(11, 0),
+            end_time=time(11, 30),
+            is_available=True,
+        )
+    )
     db.commit()
     db.refresh(slot)
     yield db
@@ -108,6 +136,12 @@ def test_query_stats(seeded_db):
     assert "by_date" in result
 
 
+def test_list_doctors_returns_multiple_doctors(seeded_db):
+    result = list_doctors(seeded_db)
+    assert len(result["doctors"]) >= 2
+    assert any(item["name"] == "Dr. Smith" for item in result["doctors"])
+
+
 @patch("app.tools.add_event_to_calendar", return_value="demo_event_123")
 @patch("app.tools.send_confirmation", return_value=True)
 def test_create_appointment_returns_alternatives_when_booked(mock_email, mock_calendar, seeded_db):
@@ -131,6 +165,45 @@ def test_create_appointment_returns_alternatives_when_booked(mock_email, mock_ca
 
     assert result["success"] is False
     assert "alternative_slots" in result
+
+
+@patch("app.tools.add_event_to_calendar", return_value="demo_event_123")
+@patch("app.tools.send_confirmation", return_value=True)
+def test_patient_can_cancel_appointment(mock_email, mock_calendar, seeded_db):
+    booking = create_appointment(
+        seeded_db,
+        doctor_name="Dr. Ahuja",
+        patient_name="Test Patient",
+        patient_email="test@example.com",
+        slot_id=1,
+    )
+    result = cancel_appointment(seeded_db, booking["appointment_id"], "test@example.com")
+    assert result["success"] is True
+    assert result["appointment"]["status"] == "cancelled"
+
+
+@patch("app.tools.add_event_to_calendar", return_value="demo_event_456")
+@patch("app.tools.send_confirmation", return_value=True)
+def test_patient_can_reschedule_appointment(mock_email, mock_calendar, seeded_db):
+    booking = create_appointment(
+        seeded_db,
+        doctor_name="Dr. Ahuja",
+        patient_name="Test Patient",
+        patient_email="test@example.com",
+        slot_id=1,
+    )
+    appointments_before = list_patient_appointments(seeded_db, "test@example.com")
+    assert len(appointments_before["appointments"]) == 1
+
+    result = reschedule_appointment(
+        seeded_db,
+        booking["appointment_id"],
+        "test@example.com",
+        new_slot_id=3,
+    )
+    assert result["success"] is True
+    assert result["appointment"]["doctor"] == "Dr. Smith"
+    assert result["appointment"]["slot_id"] == 3
 
 
 def test_demo_login_endpoint():

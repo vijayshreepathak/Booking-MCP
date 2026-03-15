@@ -34,6 +34,39 @@ export async function getSessionHistory(sessionId) {
   return res.json();
 }
 
+export async function getDoctors() {
+  const res = await fetch(`${API_BASE}/api/doctors`);
+  if (!res.ok) throw new Error("Failed to load doctors");
+  return res.json();
+}
+
+export async function getPatientAppointments(patientEmail) {
+  const res = await fetch(
+    `${API_BASE}/api/patient/appointments?patient_email=${encodeURIComponent(patientEmail)}`
+  );
+  if (!res.ok) throw new Error("Failed to load patient appointments");
+  return res.json();
+}
+
+export async function deletePatientAppointment(appointmentId, patientEmail) {
+  const res = await fetch(
+    `${API_BASE}/api/patient/appointments/${appointmentId}?patient_email=${encodeURIComponent(patientEmail)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) throw new Error("Failed to delete appointment");
+  return res.json();
+}
+
+export async function reschedulePatientAppointment(appointmentId, payload) {
+  const res = await fetch(`${API_BASE}/api/patient/appointments/${appointmentId}/reschedule`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to reschedule appointment");
+  return res.json();
+}
+
 export async function sendChat(sessionId, message, patientProfile = {}) {
   const res = await fetch(`${API_BASE}/api/chat`, {
     method: "POST",

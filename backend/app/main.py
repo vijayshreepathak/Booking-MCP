@@ -15,7 +15,16 @@ from app.db import SessionLocal, get_db, init_db
 from app.llm_orchestrator import build_messages_from_history, get_llm_response
 from app.mcp_registry import get_tools_metadata
 from app.models import PromptHistory, Session as DBSession
-from app.tools import check_availability, create_appointment, query_stats, send_notification
+from app.tools import (
+    cancel_appointment,
+    check_availability,
+    create_appointment,
+    list_doctors,
+    list_patient_appointments,
+    query_stats,
+    reschedule_appointment,
+    send_notification,
+)
 
 
 @asynccontextmanager
@@ -44,7 +53,9 @@ class MCPToolCallRequest(BaseModel):
     date_str: Optional[str] = None
     patient_name: Optional[str] = None
     patient_email: Optional[str] = None
+    appointment_id: Optional[int] = None
     slot_id: Optional[int] = None
+    new_slot_id: Optional[int] = None
     start_time_str: Optional[str] = None
     symptom: Optional[str] = "general"
     start_date: Optional[str] = None
@@ -97,6 +108,14 @@ class SessionHistoryResponse(BaseModel):
     messages: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class PatientAppointmentActionRequest(BaseModel):
+    patient_email: str
+    doctor_name: Optional[str] = None
+    new_slot_id: Optional[int] = None
+    date_str: Optional[str] = None
+    start_time_str: Optional[str] = None
+
+
 def _get_or_create_session(db: Session, session_id: str) -> DBSession:
     session = db.query(DBSession).filter(DBSession.session_id == session_id).first()
     if session:
@@ -128,6 +147,12 @@ def _extract_chat_payload(
             alternative_slots = result.get("alternative_slots", [])
         if tool_call.get("tool") == "create_appointment" and result.get("success"):
             appointment = result
+        if tool_call.get("tool") == "reschedule_appointment":
+            alternative_slots = result.get("alternative_slots", [])
+            if result.get("success"):
+                appointment = result.get("appointment")
+        if tool_call.get("tool") == "cancel_appointment" and result.get("success"):
+            appointment = result.get("appointment")
 
     return available_slots, appointment, alternative_slots
 
@@ -188,6 +213,7 @@ def _demo_credentials() -> dict[str, dict[str, str]]:
 
 
 TOOL_HANDLERS = {
+    "list_doctors": lambda db, data: list_doctors(db),
     "check_availability": lambda db, data: check_availability(
         db, data.get("doctor_name", ""), data.get("date_str", "")
     ),
@@ -213,6 +239,24 @@ TOOL_HANDLERS = {
         data.get("recipient", ""),
         data.get("message", ""),
         data.get("channel", "slack"),
+    ),
+    "list_patient_appointments": lambda db, data: list_patient_appointments(
+        db,
+        data.get("patient_email", ""),
+    ),
+    "cancel_appointment": lambda db, data: cancel_appointment(
+        db,
+        data.get("appointment_id"),
+        data.get("patient_email", ""),
+    ),
+    "reschedule_appointment": lambda db, data: reschedule_appointment(
+        db,
+        data.get("appointment_id"),
+        data.get("patient_email", ""),
+        new_slot_id=data.get("new_slot_id") or data.get("slot_id"),
+        doctor_name=data.get("doctor_name"),
+        date_str=data.get("date_str"),
+        start_time_str=data.get("start_time_str"),
     ),
 }
 
@@ -256,6 +300,42 @@ def get_session_history(session_id: str, db: Session = Depends(get_db)) -> Sessi
         session_id=session.session_id,
         session_label=_session_label(session.session_id),
         messages=_history_payload(db, session),
+    )
+
+
+@app.get("/api/doctors")
+def get_doctors(db: Session = Depends(get_db)) -> dict[str, Any]:
+    return list_doctors(db)
+
+
+@app.get("/api/patient/appointments")
+def get_patient_appointments(patient_email: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return list_patient_appointments(db, patient_email)
+
+
+@app.delete("/api/patient/appointments/{appointment_id}")
+def delete_patient_appointment(
+    appointment_id: int,
+    patient_email: str,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return cancel_appointment(db, appointment_id, patient_email)
+
+
+@app.post("/api/patient/appointments/{appointment_id}/reschedule")
+def change_patient_appointment(
+    appointment_id: int,
+    req: PatientAppointmentActionRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return reschedule_appointment(
+        db,
+        appointment_id,
+        req.patient_email,
+        new_slot_id=req.new_slot_id,
+        doctor_name=req.doctor_name,
+        date_str=req.date_str,
+        start_time_str=req.start_time_str,
     )
 
 

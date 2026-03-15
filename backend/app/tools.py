@@ -9,6 +9,70 @@ from app.calendar_integration import add_event_to_calendar
 from app.email_integration import send_confirmation
 
 
+def _serialize_slot(slot: DoctorSlot) -> dict[str, Any]:
+    return {
+        "slot_id": slot.id,
+        "doctor": slot.doctor.name if slot.doctor else None,
+        "doctor_id": slot.doctor_id,
+        "date": slot.date.strftime("%Y-%m-%d"),
+        "start_time": slot.start_time.strftime("%H:%M"),
+        "end_time": slot.end_time.strftime("%H:%M"),
+    }
+
+
+def _serialize_appointment(appointment: Appointment) -> dict[str, Any]:
+    return {
+        "appointment_id": appointment.id,
+        "doctor": appointment.doctor.name if appointment.doctor else None,
+        "doctor_id": appointment.doctor_id,
+        "patient": appointment.patient.name if appointment.patient else None,
+        "patient_email": appointment.patient.email if appointment.patient else None,
+        "date": appointment.appointment_date.strftime("%Y-%m-%d"),
+        "start_time": appointment.start_time.strftime("%H:%M"),
+        "end_time": appointment.slot.end_time.strftime("%H:%M") if appointment.slot else None,
+        "slot_id": appointment.slot_id,
+        "status": appointment.status,
+        "calendar_event_id": appointment.calendar_event_id,
+    }
+
+
+def list_doctors(db: Session) -> dict[str, Any]:
+    """Return all configured doctors with light scheduling metadata."""
+    doctors_payload = []
+    doctors = db.query(Doctor).order_by(Doctor.name.asc()).all()
+    for doctor in doctors:
+        next_slot = (
+            db.query(DoctorSlot)
+            .filter(
+                DoctorSlot.doctor_id == doctor.id,
+                DoctorSlot.is_available.is_(True),
+                DoctorSlot.date >= datetime.utcnow().date(),
+            )
+            .order_by(DoctorSlot.date.asc(), DoctorSlot.start_time.asc())
+            .first()
+        )
+        available_count = (
+            db.query(DoctorSlot)
+            .filter(
+                DoctorSlot.doctor_id == doctor.id,
+                DoctorSlot.is_available.is_(True),
+                DoctorSlot.date >= datetime.utcnow().date(),
+            )
+            .count()
+        )
+        doctors_payload.append(
+            {
+                "doctor_id": doctor.id,
+                "name": doctor.name,
+                "specialization": doctor.specialization,
+                "email": doctor.email,
+                "available_slots": available_count,
+                "next_available_slot": _serialize_slot(next_slot) if next_slot else None,
+            }
+        )
+    return {"doctors": doctors_payload}
+
+
 def check_availability(
     db: Session,
     doctor_name: str,
@@ -35,12 +99,7 @@ def check_availability(
     ).all():
         has_appt = db.query(Appointment).filter(Appointment.slot_id == slot.id).first()
         if not has_appt:
-            available.append({
-                "slot_id": slot.id,
-                "start_time": slot.start_time.strftime("%H:%M"),
-                "end_time": slot.end_time.strftime("%H:%M"),
-                "date": slot.date.strftime("%Y-%m-%d"),
-            })
+            available.append(_serialize_slot(slot))
     return {"available_slots": available, "doctor": doctor.name}
 
 
@@ -76,17 +135,68 @@ def find_next_available_slots(
         has_appt = db.query(Appointment).filter(Appointment.slot_id == slot.id).first()
         if has_appt:
             continue
-        alternatives.append(
-            {
-                "slot_id": slot.id,
-                "date": slot.date.strftime("%Y-%m-%d"),
-                "start_time": slot.start_time.strftime("%H:%M"),
-                "end_time": slot.end_time.strftime("%H:%M"),
-            }
-        )
+        alternatives.append(_serialize_slot(slot))
         if len(alternatives) >= limit:
             break
     return alternatives
+
+
+def _resolve_target_slot(
+    db: Session,
+    current_doctor_name: str,
+    slot_id: Optional[int] = None,
+    date_str: Optional[str] = None,
+    start_time_str: Optional[str] = None,
+    doctor_name: Optional[str] = None,
+) -> tuple[Optional[Doctor], Optional[DoctorSlot], Optional[dict[str, Any]]]:
+    doctor = None
+    slot = None
+    desired_doctor_name = doctor_name or current_doctor_name
+
+    if slot_id is not None:
+        slot = db.query(DoctorSlot).filter(DoctorSlot.id == slot_id).first()
+        if not slot:
+            return None, None, {
+                "success": False,
+                "error": f"Slot {slot_id} was not found.",
+                "alternative_slots": find_next_available_slots(
+                    db,
+                    desired_doctor_name,
+                    datetime.utcnow().strftime("%Y-%m-%d"),
+                ),
+            }
+        doctor = db.query(Doctor).filter(Doctor.id == slot.doctor_id).first()
+        return doctor, slot, None
+
+    doctor = db.query(Doctor).filter(Doctor.name.ilike(f"%{desired_doctor_name}%")).first()
+    if not doctor:
+        return None, None, {"success": False, "error": f"Doctor '{desired_doctor_name}' not found."}
+
+    if not (date_str and start_time_str):
+        return doctor, None, {
+            "success": False,
+            "error": "Provide new_slot_id or date_str and start_time_str.",
+        }
+
+    try:
+        appt_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        start_t = datetime.strptime(start_time_str, "%H:%M").time()
+    except ValueError:
+        return doctor, None, {"success": False, "error": "Invalid date or time format."}
+
+    slot = db.query(DoctorSlot).filter(
+        DoctorSlot.doctor_id == doctor.id,
+        DoctorSlot.date == appt_date,
+        DoctorSlot.start_time == start_t,
+    ).first()
+    if not slot:
+        return doctor, None, {
+            "success": False,
+            "error": "The requested slot does not exist.",
+            "alternative_slots": find_next_available_slots(db, doctor.name, date_str),
+        }
+
+    return doctor, slot, None
 
 
 def create_appointment(
@@ -212,6 +322,151 @@ def create_appointment(
         "calendar_event_id": calendar_event_id,
         "email_sent": email_sent,
         "message": "Appointment booked successfully.",
+        "alternative_slots": [],
+    }
+
+
+def list_patient_appointments(
+    db: Session,
+    patient_email: str,
+    include_cancelled: bool = False,
+) -> dict[str, Any]:
+    """Return a patient's appointments for self-service management."""
+    if not patient_email:
+        return {"appointments": [], "error": "Patient email is required."}
+
+    patient = db.query(Patient).filter(Patient.email == patient_email).first()
+    if not patient:
+        return {"appointments": [], "patient_email": patient_email}
+
+    appointments_query = db.query(Appointment).filter(Appointment.patient_id == patient.id)
+    if not include_cancelled:
+        appointments_query = appointments_query.filter(Appointment.status != "cancelled")
+
+    appointments = (
+        appointments_query
+        .order_by(Appointment.appointment_date.asc(), Appointment.start_time.asc())
+        .all()
+    )
+    return {
+        "patient": patient.name,
+        "patient_email": patient.email,
+        "appointments": [_serialize_appointment(appointment) for appointment in appointments],
+    }
+
+
+def cancel_appointment(
+    db: Session,
+    appointment_id: int,
+    patient_email: str,
+) -> dict[str, Any]:
+    """Cancel a patient's appointment and release the reserved slot."""
+    appointment = (
+        db.query(Appointment)
+        .join(Patient)
+        .filter(Appointment.id == appointment_id, Patient.email == patient_email)
+        .first()
+    )
+    if not appointment:
+        return {"success": False, "error": "Appointment not found for this patient."}
+    if appointment.status == "cancelled":
+        return {"success": False, "error": "Appointment is already cancelled."}
+
+    if appointment.slot:
+        appointment.slot.is_available = True
+    appointment.status = "cancelled"
+    db.commit()
+    db.refresh(appointment)
+    return {
+        "success": True,
+        "message": "Appointment cancelled successfully.",
+        "appointment": _serialize_appointment(appointment),
+    }
+
+
+def reschedule_appointment(
+    db: Session,
+    appointment_id: int,
+    patient_email: str,
+    new_slot_id: Optional[int] = None,
+    doctor_name: Optional[str] = None,
+    date_str: Optional[str] = None,
+    start_time_str: Optional[str] = None,
+) -> dict[str, Any]:
+    """Move an appointment to a new slot and release the old one."""
+    appointment = (
+        db.query(Appointment)
+        .join(Patient)
+        .filter(Appointment.id == appointment_id, Patient.email == patient_email)
+        .first()
+    )
+    if not appointment:
+        return {"success": False, "error": "Appointment not found for this patient."}
+    if appointment.status == "cancelled":
+        return {"success": False, "error": "Cancelled appointments cannot be changed."}
+
+    target_doctor, target_slot, error = _resolve_target_slot(
+        db,
+        current_doctor_name=appointment.doctor.name,
+        slot_id=new_slot_id,
+        date_str=date_str,
+        start_time_str=start_time_str,
+        doctor_name=doctor_name,
+    )
+    if error:
+        return error
+    if not target_doctor or not target_slot:
+        return {"success": False, "error": "Unable to resolve the new appointment slot."}
+    if appointment.slot_id == target_slot.id:
+        return {"success": False, "error": "Choose a different slot to reschedule."}
+
+    existing = db.query(Appointment).filter(Appointment.slot_id == target_slot.id).first()
+    if existing or not target_slot.is_available:
+        return {
+            "success": False,
+            "error": "The selected new slot is already booked.",
+            "alternative_slots": find_next_available_slots(
+                db,
+                target_doctor.name,
+                target_slot.date.strftime("%Y-%m-%d"),
+            ),
+        }
+
+    old_slot = appointment.slot
+    try:
+        if old_slot:
+            old_slot.is_available = True
+        target_slot.is_available = False
+        appointment.doctor_id = target_doctor.id
+        appointment.slot_id = target_slot.id
+        appointment.appointment_date = target_slot.date
+        appointment.start_time = target_slot.start_time
+        appointment.status = "confirmed"
+        appointment.calendar_event_id = add_event_to_calendar(
+            doctor_name=target_doctor.name,
+            patient_name=appointment.patient.name,
+            patient_email=appointment.patient.email,
+            start_datetime=datetime.combine(target_slot.date, target_slot.start_time),
+            end_datetime=datetime.combine(target_slot.date, target_slot.end_time),
+        )
+        email_sent = send_confirmation(
+            to_email=appointment.patient.email,
+            patient_name=appointment.patient.name,
+            doctor_name=target_doctor.name,
+            appointment_date=target_slot.date.strftime("%Y-%m-%d"),
+            start_time=target_slot.start_time.strftime("%H:%M"),
+        )
+        db.commit()
+        db.refresh(appointment)
+    except Exception as exc:
+        db.rollback()
+        return {"success": False, "error": f"Reschedule failed: {exc}"}
+
+    return {
+        "success": True,
+        "message": "Appointment updated successfully.",
+        "appointment": _serialize_appointment(appointment),
+        "email_sent": email_sent,
         "alternative_slots": [],
     }
 

@@ -12,6 +12,21 @@ def get_tools_metadata(base_url: str = BASE_URL) -> list[dict[str, Any]]:
     """Return MCP tool metadata with input/output schemas and call URL."""
     return [
         {
+            "name": "list_doctors",
+            "description": "List all doctors with specialization and next available slot information.",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "doctors": {"type": "array", "items": {"type": "object"}},
+                },
+            },
+            "call_url": f"{base_url}/mcp/tools/list_doctors/call",
+        },
+        {
             "name": "check_availability",
             "description": "Check available appointment slots for a doctor on a given date. Returns list of available time slots.",
             "input_schema": {
@@ -109,5 +124,74 @@ def get_tools_metadata(base_url: str = BASE_URL) -> list[dict[str, Any]]:
                 },
             },
             "call_url": f"{base_url}/mcp/tools/send_notification/call",
+        },
+        {
+            "name": "list_patient_appointments",
+            "description": "Return the current patient's appointments for self-service management.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "patient_email": {"type": "string"},
+                },
+                "required": ["patient_email"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "appointments": {"type": "array", "items": {"type": "object"}},
+                    "patient": {"type": "string"},
+                    "patient_email": {"type": "string"},
+                },
+            },
+            "call_url": f"{base_url}/mcp/tools/list_patient_appointments/call",
+        },
+        {
+            "name": "cancel_appointment",
+            "description": "Cancel an existing patient appointment and release the booked slot.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "appointment_id": {"type": "integer"},
+                    "patient_email": {"type": "string"},
+                },
+                "required": ["appointment_id", "patient_email"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {"type": "boolean"},
+                    "message": {"type": "string"},
+                    "appointment": {"type": "object"},
+                    "error": {"type": "string"},
+                },
+            },
+            "call_url": f"{base_url}/mcp/tools/cancel_appointment/call",
+        },
+        {
+            "name": "reschedule_appointment",
+            "description": "Move an existing patient appointment to a different doctor slot.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "appointment_id": {"type": "integer"},
+                    "patient_email": {"type": "string"},
+                    "doctor_name": {"type": "string"},
+                    "new_slot_id": {"type": "integer"},
+                    "date_str": {"type": "string"},
+                    "start_time_str": {"type": "string"},
+                },
+                "required": ["appointment_id", "patient_email"],
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {
+                    "success": {"type": "boolean"},
+                    "message": {"type": "string"},
+                    "appointment": {"type": "object"},
+                    "alternative_slots": {"type": "array", "items": {"type": "object"}},
+                    "error": {"type": "string"},
+                },
+            },
+            "call_url": f"{base_url}/mcp/tools/reschedule_appointment/call",
         },
     ]

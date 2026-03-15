@@ -220,6 +220,57 @@ select {
   border-color: #4f6cf5;
 }
 
+.secondary-button {
+  margin-top: 14px;
+  width: 100%;
+}
+
+.doctor-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.doctor-card,
+.patient-appointment-card {
+  border: 1px solid #dbe4f0;
+  background: #fff;
+  border-radius: 14px;
+  padding: 12px;
+  display: grid;
+  gap: 6px;
+  text-align: left;
+}
+
+.doctor-card {
+  cursor: pointer;
+}
+
+.doctor-card.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.patient-appointment-card {
+  margin-top: 12px;
+}
+
+.inline-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.active-action {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.danger-action {
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+
 .chat-window {
   min-height: 520px;
   max-height: 620px;
