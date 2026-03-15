@@ -13,18 +13,8 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, get_db, init_db
 from app.llm_orchestrator import build_messages_from_history, get_llm_response
-from app.mcp_registry import get_tools_metadata
+from app.mcp_client import MCPClientError, call_tool as call_mcp_protocol_tool, get_legacy_tools_metadata
 from app.models import PromptHistory, Session as DBSession
-from app.tools import (
-    cancel_appointment,
-    check_availability,
-    create_appointment,
-    list_doctors,
-    list_patient_appointments,
-    query_stats,
-    reschedule_appointment,
-    send_notification,
-)
 
 
 @asynccontextmanager
@@ -211,56 +201,6 @@ def _demo_credentials() -> dict[str, dict[str, str]]:
         },
     }
 
-
-TOOL_HANDLERS = {
-    "list_doctors": lambda db, data: list_doctors(db),
-    "check_availability": lambda db, data: check_availability(
-        db, data.get("doctor_name", ""), data.get("date_str", "")
-    ),
-    "create_appointment": lambda db, data: create_appointment(
-        db,
-        data.get("doctor_name", ""),
-        data.get("patient_name", ""),
-        data.get("patient_email", ""),
-        slot_id=data.get("slot_id"),
-        date_str=data.get("date_str"),
-        start_time_str=data.get("start_time_str"),
-        symptom=data.get("symptom", "general"),
-    ),
-    "query_stats": lambda db, data: query_stats(
-        db,
-        doctor_name=data.get("doctor_name"),
-        start_date=data.get("start_date"),
-        end_date=data.get("end_date"),
-        symptom_filter=data.get("symptom_filter"),
-    ),
-    "send_notification": lambda db, data: send_notification(
-        db,
-        data.get("recipient", ""),
-        data.get("message", ""),
-        data.get("channel", "slack"),
-    ),
-    "list_patient_appointments": lambda db, data: list_patient_appointments(
-        db,
-        data.get("patient_email", ""),
-    ),
-    "cancel_appointment": lambda db, data: cancel_appointment(
-        db,
-        data.get("appointment_id"),
-        data.get("patient_email", ""),
-    ),
-    "reschedule_appointment": lambda db, data: reschedule_appointment(
-        db,
-        data.get("appointment_id"),
-        data.get("patient_email", ""),
-        new_slot_id=data.get("new_slot_id") or data.get("slot_id"),
-        doctor_name=data.get("doctor_name"),
-        date_str=data.get("date_str"),
-        start_time_str=data.get("start_time_str"),
-    ),
-}
-
-
 @app.post("/api/sessions")
 def create_session() -> dict[str, str]:
     session_id = str(uuid.uuid4())
@@ -304,52 +244,56 @@ def get_session_history(session_id: str, db: Session = Depends(get_db)) -> Sessi
 
 
 @app.get("/api/doctors")
-def get_doctors(db: Session = Depends(get_db)) -> dict[str, Any]:
-    return list_doctors(db)
+def get_doctors() -> dict[str, Any]:
+    return call_mcp_protocol_tool("list_doctors", {})
 
 
 @app.get("/api/patient/appointments")
-def get_patient_appointments(patient_email: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    return list_patient_appointments(db, patient_email)
+def get_patient_appointments(patient_email: str) -> dict[str, Any]:
+    return call_mcp_protocol_tool("list_patient_appointments", {"patient_email": patient_email})
 
 
 @app.delete("/api/patient/appointments/{appointment_id}")
 def delete_patient_appointment(
     appointment_id: int,
     patient_email: str,
-    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return cancel_appointment(db, appointment_id, patient_email)
+    return call_mcp_protocol_tool(
+        "cancel_appointment",
+        {"appointment_id": appointment_id, "patient_email": patient_email},
+    )
 
 
 @app.post("/api/patient/appointments/{appointment_id}/reschedule")
 def change_patient_appointment(
     appointment_id: int,
     req: PatientAppointmentActionRequest,
-    db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return reschedule_appointment(
-        db,
-        appointment_id,
-        req.patient_email,
-        new_slot_id=req.new_slot_id,
-        doctor_name=req.doctor_name,
-        date_str=req.date_str,
-        start_time_str=req.start_time_str,
+    return call_mcp_protocol_tool(
+        "reschedule_appointment",
+        {
+            "appointment_id": appointment_id,
+            "patient_email": req.patient_email,
+            "new_slot_id": req.new_slot_id,
+            "doctor_name": req.doctor_name,
+            "date_str": req.date_str,
+            "start_time_str": req.start_time_str,
+        },
     )
 
 
 @app.get("/mcp/tools")
 def list_mcp_tools() -> list[dict[str, Any]]:
     base_url = os.getenv("BASE_URL", "http://localhost:8000")
-    return get_tools_metadata(base_url)
+    return get_legacy_tools_metadata(base_url)
 
 
 @app.post("/mcp/tools/{tool_name}/call")
-def call_mcp_tool(tool_name: str, body: MCPToolCallRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
-    if tool_name not in TOOL_HANDLERS:
-        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
-    return TOOL_HANDLERS[tool_name](db, body.model_dump(exclude_none=True))
+def call_mcp_tool(tool_name: str, body: MCPToolCallRequest) -> dict[str, Any]:
+    try:
+        return call_mcp_protocol_tool(tool_name, body.model_dump(exclude_none=True))
+    except MCPClientError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -400,26 +344,32 @@ def api_doctor_summary(req: DoctorSummaryRequest, db: Session = Depends(get_db))
     yesterday = today - timedelta(days=1)
     tomorrow = today + timedelta(days=1)
 
-    stats_today = query_stats(
-        db,
-        doctor_name=req.doctor_name,
-        start_date=str(today),
-        end_date=str(today),
-        symptom_filter=preferences["symptom_filter"],
+    stats_today = call_mcp_protocol_tool(
+        "query_stats",
+        {
+            "doctor_name": req.doctor_name,
+            "start_date": str(today),
+            "end_date": str(today),
+            "symptom_filter": preferences["symptom_filter"],
+        },
     )
-    stats_yesterday = query_stats(
-        db,
-        doctor_name=req.doctor_name,
-        start_date=str(yesterday),
-        end_date=str(yesterday),
-        symptom_filter=preferences["symptom_filter"],
+    stats_yesterday = call_mcp_protocol_tool(
+        "query_stats",
+        {
+            "doctor_name": req.doctor_name,
+            "start_date": str(yesterday),
+            "end_date": str(yesterday),
+            "symptom_filter": preferences["symptom_filter"],
+        },
     )
-    stats_tomorrow = query_stats(
-        db,
-        doctor_name=req.doctor_name,
-        start_date=str(tomorrow),
-        end_date=str(tomorrow),
-        symptom_filter=preferences["symptom_filter"],
+    stats_tomorrow = call_mcp_protocol_tool(
+        "query_stats",
+        {
+            "doctor_name": req.doctor_name,
+            "start_date": str(tomorrow),
+            "end_date": str(tomorrow),
+            "symptom_filter": preferences["symptom_filter"],
+        },
     )
 
     report_lines = [f"Schedule summary for {req.doctor_name}"]
@@ -438,11 +388,13 @@ def api_doctor_summary(req: DoctorSummaryRequest, db: Session = Depends(get_db))
         report_lines.append(f"Tomorrow: {stats_tomorrow['total_appointments']} appointments")
 
     report = "\n".join(report_lines)
-    notification = send_notification(
-        db,
-        recipient=req.doctor_name,
-        message=report,
-        channel="slack",
+    notification = call_mcp_protocol_tool(
+        "send_notification",
+        {
+            "recipient": req.doctor_name,
+            "message": report,
+            "channel": "slack",
+        },
     )
 
     return {

@@ -5,7 +5,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
-import httpx
+from app.mcp_client import call_tool as call_mcp_protocol_tool
+from app.mcp_client import get_legacy_tools_metadata
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "demo")
@@ -31,97 +32,14 @@ def _get_tools_for_openai() -> list:
 
 def _fetch_tools_metadata() -> list:
     try:
-        from app.mcp_registry import get_tools_metadata
-
-        return get_tools_metadata(BASE_URL)
+        return get_legacy_tools_metadata(BASE_URL)
     except Exception:
-        pass
-
-    try:
-        response = httpx.get(f"{BASE_URL}/mcp/tools", timeout=5)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
-
-    return []
+        return []
 
 
 def _call_tool(tool_name: str, arguments: dict, db=None) -> Any:
-    if db is not None:
-        try:
-            from app.tools import (
-                cancel_appointment,
-                check_availability,
-                create_appointment,
-                list_doctors,
-                list_patient_appointments,
-                query_stats,
-                reschedule_appointment,
-                send_notification,
-            )
-
-            handlers = {
-                "list_doctors": lambda: list_doctors(db),
-                "check_availability": lambda: check_availability(
-                    db, arguments.get("doctor_name", ""), arguments.get("date_str", "")
-                ),
-                "create_appointment": lambda: create_appointment(
-                    db,
-                    arguments.get("doctor_name", ""),
-                    arguments.get("patient_name", ""),
-                    arguments.get("patient_email", ""),
-                    slot_id=arguments.get("slot_id"),
-                    date_str=arguments.get("date_str"),
-                    start_time_str=arguments.get("start_time_str"),
-                    symptom=arguments.get("symptom", "general"),
-                ),
-                "query_stats": lambda: query_stats(
-                    db,
-                    doctor_name=arguments.get("doctor_name"),
-                    start_date=arguments.get("start_date"),
-                    end_date=arguments.get("end_date"),
-                    symptom_filter=arguments.get("symptom_filter"),
-                ),
-                "send_notification": lambda: send_notification(
-                    db,
-                    arguments.get("recipient", ""),
-                    arguments.get("message", ""),
-                    arguments.get("channel", "slack"),
-                ),
-                "list_patient_appointments": lambda: list_patient_appointments(
-                    db,
-                    arguments.get("patient_email", ""),
-                ),
-                "cancel_appointment": lambda: cancel_appointment(
-                    db,
-                    arguments.get("appointment_id"),
-                    arguments.get("patient_email", ""),
-                ),
-                "reschedule_appointment": lambda: reschedule_appointment(
-                    db,
-                    arguments.get("appointment_id"),
-                    arguments.get("patient_email", ""),
-                    new_slot_id=arguments.get("new_slot_id") or arguments.get("slot_id"),
-                    doctor_name=arguments.get("doctor_name"),
-                    date_str=arguments.get("date_str"),
-                    start_time_str=arguments.get("start_time_str"),
-                ),
-            }
-            if tool_name in handlers:
-                return handlers[tool_name]()
-        except Exception as exc:
-            return {"error": str(exc)}
-
     try:
-        response = httpx.post(
-            f"{BASE_URL}/mcp/tools/{tool_name}/call",
-            json=arguments,
-            timeout=30,
-        )
-        if response.status_code == 200:
-            return response.json()
-        return {"error": response.text}
+        return call_mcp_protocol_tool(tool_name, arguments)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -547,6 +465,8 @@ def _anthropic_response(messages: list, db=None) -> tuple[str, list]:
 
 def _local_llm_response(messages: list, db=None) -> tuple[str, list]:
     """Use local LLM via HTTP (e.g. Ollama-compatible)."""
+    import httpx
+
     system_content = _get_system_prompt()
     msgs = [{"role": "system", "content": system_content}] + [
         {"role": m["role"], "content": m.get("content", "")} for m in messages

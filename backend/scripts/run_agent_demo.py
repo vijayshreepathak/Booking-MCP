@@ -17,10 +17,11 @@ Usage:
 import os
 import sys
 import json
-import httpx
 
 # Add parent to path for imports when run as script
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from app.mcp_client import call_tool, get_legacy_tools_metadata
 
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "demo")
@@ -28,33 +29,58 @@ USER_MESSAGE = "I want to book an appointment with Dr. Ahuja tomorrow morning"
 
 
 def fetch_tools():
-    """Discover MCP tools from registry."""
-    r = httpx.get(f"{BASE_URL}/mcp/tools", timeout=10)
-    r.raise_for_status()
-    return r.json()
+    """Discover tools through the MCP client."""
+    return get_legacy_tools_metadata(BASE_URL)
 
 
 def call_tool(tool_name: str, arguments: dict) -> dict:
-    """Call MCP tool via POST."""
-    r = httpx.post(
-        f"{BASE_URL}/mcp/tools/{tool_name}/call",
-        json=arguments,
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+    """Call a tool through the MCP protocol client."""
+    from app.mcp_client import call_tool as call_mcp_protocol_tool
+
+    return call_mcp_protocol_tool(tool_name, arguments)
 
 
 def run_demo_mode():
-    """Demo mode: use /api/chat to get response (backend handles tool orchestration)."""
-    r = httpx.post(
-        f"{BASE_URL}/api/chat",
-        json={"session_id": "agent_demo_session", "message": USER_MESSAGE},
-        timeout=60,
+    """Demo mode: deterministically orchestrate tools through the MCP client."""
+    from datetime import datetime, timedelta
+
+    date_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    availability = call_tool(
+        "check_availability",
+        {"doctor_name": "Dr. Ahuja", "date_str": date_str},
     )
-    r.raise_for_status()
-    data = r.json()
-    return data.get("response", ""), data.get("tool_calls", [])
+    tool_calls = [
+        {
+            "tool": "check_availability",
+            "arguments": {"doctor_name": "Dr. Ahuja", "date_str": date_str},
+            "result": availability,
+        }
+    ]
+    slots = availability.get("available_slots", [])
+    if not slots:
+        return f"No available slots found for Dr. Ahuja on {date_str}.", tool_calls
+
+    booking_args = {
+        "doctor_name": "Dr. Ahuja",
+        "patient_name": "Demo Patient",
+        "patient_email": "patient@demo.local",
+        "slot_id": slots[0]["slot_id"],
+    }
+    booking = call_tool("create_appointment", booking_args)
+    tool_calls.append(
+        {
+            "tool": "create_appointment",
+            "arguments": booking_args,
+            "result": booking,
+        }
+    )
+    if booking.get("success"):
+        return (
+            f"Appointment confirmed for {booking['patient']} with {booking['doctor']} "
+            f"on {booking['date']} at {booking['start_time']}.",
+            tool_calls,
+        )
+    return booking.get("error", "Booking failed."), tool_calls
 
 
 def run_openai_mode():

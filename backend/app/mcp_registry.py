@@ -1,7 +1,8 @@
 """
-MCP tool registry.
-Exposes tool metadata at /mcp/tools for LLM agent discovery.
-Note: We implement a small custom registry rather than fastapi_mcp - no external MCP package used.
+Metadata registry shared by the MCP server and REST compatibility endpoints.
+
+The actual protocol server lives in `app.mcp_server_app` and exposes tools through
+JSON-RPC MCP methods such as `initialize`, `tools/list`, and `tools/call`.
 """
 from typing import Any
 

@@ -7,7 +7,7 @@ This application bridges the gap between natural language processing and complex
 ### 🌟 What this app does:
 - **For Patients:** Discover doctor availability and book, reschedule, or cancel appointments using natural language.
 - **For Doctors:** Request smart schedule summaries and receive automated notifications.
-- **For AI Agents:** Dynamically discover and execute backend capabilities through an MCP-style tool registry.
+- **For AI Agents:** Dynamically discover and execute backend capabilities through a real MCP client/server workflow.
 
 🔗 **GitHub repository:** [vijayshreepathak/Booking-MCP](https://github.com/vijayshreepathak/Booking-MCP)
 
@@ -40,7 +40,9 @@ Feel free to reach out if you have questions, feedback, or just want to connect!
 
 ### Core requirements covered
 
+- True MCP client-server separation between the web backend and the MCP tool server
 - FastAPI backend with MCP registry and tool-call endpoints
+- Dedicated MCP server exposing `initialize`, `tools/list`, and `tools/call`
 - React frontend for patient chat and doctor dashboard
 - PostgreSQL-backed scheduling and appointment data
 - Multi-turn continuity using `Session` and `PromptHistory`
@@ -65,13 +67,15 @@ Feel free to reach out if you have questions, feedback, or just want to connect!
 flowchart LR
     U[User]
     F[React Frontend]
-    B[FastAPI Backend]
-    M[MCP Registry]
-    A[Agent Orchestrator]
-    T1[check_availability]
-    T2[create_appointment]
-    T3[query_stats]
-    T4[send_notification]
+    B[FastAPI App Backend]
+    C[MCP Client Layer]
+    S[Standalone MCP Server]
+    A[LLM Agent Orchestrator]
+    T1[list_doctors]
+    T2[check_availability]
+    T3[create_appointment]
+    T4[query_stats]
+    T5[send_notification]
     DB[(PostgreSQL)]
     GC[Google Calendar Wrapper]
     EM[Email Wrapper]
@@ -79,19 +83,31 @@ flowchart LR
 
     U --> F
     F --> B
-    B --> M
     B --> A
-    A --> T1
-    A --> T2
-    A --> T3
-    A --> T4
+    A --> C
+    B --> C
+    C --> S
+    S --> T1
+    S --> T2
+    S --> T3
+    S --> T4
+    S --> T5
     T1 --> DB
     T2 --> DB
-    T2 --> GC
-    T2 --> EM
     T3 --> DB
-    T4 --> NF
+    T3 --> GC
+    T3 --> EM
+    T4 --> DB
+    T5 --> NF
 ```
+
+### MCP flow in this implementation
+
+1. The React frontend talks to the FastAPI backend.
+2. The FastAPI backend acts as an **MCP client**, not as the tool executor.
+3. A separate `mcp-server` process exposes tools over a JSON-RPC MCP interface at `POST /mcp`.
+4. The backend discovers tools dynamically through `tools/list` and invokes them through `tools/call`.
+5. The MCP server is the only layer that directly executes tool logic against the database and integrations.
 
 ## Project Structure
 
@@ -99,7 +115,10 @@ flowchart LR
 backend/
   app/
     main.py
+    mcp_client.py
+    mcp_server_app.py
     tools.py
+    tool_dispatcher.py
     models.py
     db.py
     calendar_integration.py
@@ -131,16 +150,17 @@ README.md
 2. Patient can select from multiple doctors in the sidebar or ask in chat: `I want to book an appointment with Dr. Ahuja tomorrow morning`
 3. Agent logic:
    - interprets the request
-   - calls `check_availability`
+   - discovers tools from the MCP server
+   - calls `check_availability` through the MCP client
    - returns available slots in chat and as clickable cards
 4. Patient follows up with:
    - `Book slot 10`
    - or `Book the 9:00 AM slot`
 5. Agent logic:
-   - calls `create_appointment`
-   - writes appointment to DB
-   - creates a Google Calendar event through the wrapper
-   - sends email through the wrapper
+   - calls `create_appointment` through the MCP server
+   - the MCP server writes the appointment to DB
+   - the MCP server creates a Google Calendar event through the wrapper
+   - the MCP server sends email through the wrapper
    - returns a confirmation card in the UI
 6. Patients can review current bookings, change to a different doctor/slot, or delete an appointment directly from the sidebar.
 7. If the slot is unavailable, the backend returns alternative slots and the UI presents them as rescheduling options.
@@ -153,14 +173,26 @@ README.md
    - `How many appointments do I have today, tomorrow`
    - `How many patient with fever`
 3. Backend calls `query_stats`
-4. Backend formats a readable report and sends it through `send_notification`
+4. Backend invokes `query_stats` and `send_notification` through the MCP client/server boundary
 5. If Slack is not configured, the report is stored as an in-app notification
 
 ## MCP Interface
 
-### Tool registry
+### Protocol endpoint
+
+- `POST /mcp` on the standalone MCP server
+
+Supported MCP methods:
+
+- `initialize`
+- `tools/list`
+- `tools/call`
+
+### REST compatibility registry
 
 - `GET /mcp/tools`
+
+The FastAPI backend also exposes compatibility endpoints for easier manual testing and assignment checks. These endpoints proxy through the MCP server rather than executing tools directly.
 
 Returns metadata for every tool:
 
@@ -191,6 +223,7 @@ Supported tools:
 
 | Endpoint | Description |
 |---|---|
+| `POST /mcp` | Standalone MCP server protocol endpoint |
 | `POST /api/auth/login` | Demo role-based login for patient or doctor |
 | `GET /api/doctors` | List doctors for UI selection |
 | `POST /api/sessions` | Create a session |
@@ -230,9 +263,10 @@ Available URLs:
 
 - Frontend: [http://localhost:3000](http://localhost:3000)
 - Backend: [http://localhost:8000](http://localhost:8000)
+- MCP server: [http://localhost:8100/health](http://localhost:8100/health)
 - Swagger docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-The backend seeds 2 doctors and sample slots automatically.
+The backend and MCP server both use the same database, and the backend talks to the MCP server through `MCP_SERVER_URL`.
 
 ### Local run
 
@@ -250,7 +284,16 @@ Create a DB named `appointment_db`, then export:
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/appointment_db
 ```
 
-#### 3. Run backend
+#### 3. Run MCP server
+
+```bash
+cd backend
+pip install -r requirements.txt
+python scripts/seed_db.py
+uvicorn app.mcp_server_app:app --reload --host 0.0.0.0 --port 8100
+```
+
+#### 4. Run backend
 
 ```bash
 cd backend
@@ -259,7 +302,7 @@ python scripts/seed_db.py
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-#### 4. Run frontend
+#### 5. Run frontend
 
 ```bash
 cd frontend
@@ -278,7 +321,8 @@ python scripts/run_agent_demo.py
 
 The script:
 
-- fetches `GET /mcp/tools`
+- initializes an MCP session
+- discovers tools through the MCP server
 - builds a system prompt
 - sends the example booking request
 - handles tool calls
@@ -294,6 +338,7 @@ Copy `.env.example` to `.env`.
 |---|---|
 | `DATABASE_URL` | Database connection string |
 | `BASE_URL` | Backend URL used in MCP call metadata |
+| `MCP_SERVER_URL` | MCP server endpoint used by the backend client |
 | `LLM_PROVIDER` | `demo`, `openai`, `anthropic`, or `local` |
 
 ### Demo login
@@ -392,6 +437,9 @@ npm run build
 
 ### What is verified
 
+- MCP protocol initialization
+- MCP `tools/list` dynamic discovery
+- MCP `tools/call` execution
 - multiple doctor listing and selection
 - booking success
 - patient appointment change and delete flows
@@ -406,6 +454,8 @@ npm run build
 
 This submission is still a demo, but it includes several production-style practices:
 
+- actual protocol-based MCP tool orchestration
+- clear service boundary between backend client and MCP server
 - modular backend structure
 - clear MCP tool boundaries
 - graceful fallback integrations
