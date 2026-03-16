@@ -86,6 +86,18 @@ class PromptHistory(Base):
     session = relationship("Session", back_populates="history")
 
 
+class AgentMemory(Base):
+    __tablename__ = "agent_memory"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=False, unique=True)
+    summary = Column(Text, nullable=True)
+    memory_json = Column(Text, nullable=False, default="{}")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    session = relationship("Session")
+
+
 class InAppNotification(Base):
     """Fallback when Slack webhook is not configured."""
     __tablename__ = "in_app_notifications"

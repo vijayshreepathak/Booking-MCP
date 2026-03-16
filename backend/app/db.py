@@ -39,5 +39,14 @@ def get_db():
 
 def init_db():
     """Create all tables (for development; Alembic for migrations)."""
-    from app.models import Doctor, DoctorSlot, Patient, Appointment, Session, PromptHistory, InAppNotification
+    from app.models import (
+        AgentMemory,
+        Appointment,
+        Doctor,
+        DoctorSlot,
+        InAppNotification,
+        Patient,
+        PromptHistory,
+        Session,
+    )
     Base.metadata.create_all(bind=engine)

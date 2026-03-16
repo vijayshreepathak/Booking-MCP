@@ -12,8 +12,10 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from app.agent_memory import load_memory, update_memory_from_tool_calls, update_memory_from_user_message
 from app.db import Base
-from app.models import Doctor, DoctorSlot, Patient, Appointment
+from app.llm_orchestrator import _demo_mode_response
+from app.models import Doctor, DoctorSlot, Patient, Appointment, Session as DBSession
 from app.tools import (
     cancel_appointment,
     check_availability,
@@ -221,3 +223,96 @@ def test_demo_login_endpoint():
         data = response.json()
         assert data["role"] == "patient"
         assert data["email"] == "patient@demo.local"
+
+
+def test_agent_memory_tracks_structured_context(db):
+    session = DBSession(session_id="memory-session", role="patient")
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    memory = update_memory_from_user_message(
+        db,
+        session.id,
+        "Show Dr. Smith availability for tomorrow morning",
+        {"patient_name": "Demo Patient", "patient_email": "patient@demo.local"},
+    )
+    assert memory["selected_doctor"] == "Dr. Smith"
+    assert memory["time_preference"] == "morning"
+
+    update_memory_from_tool_calls(
+        db,
+        session.id,
+        [
+            {
+                "tool": "check_availability",
+                "arguments": {"doctor_name": "Dr. Smith", "date_str": "2025-03-16"},
+                "result": {
+                    "available_slots": [
+                        {"slot_id": 42, "doctor": "Dr. Smith", "date": "2025-03-16", "start_time": "09:00"}
+                    ]
+                },
+            }
+        ],
+    )
+    loaded = load_memory(db, session.id)
+    assert loaded["last_available_slots"][0]["slot_id"] == 42
+
+
+def test_demo_mode_uses_memory_for_follow_up_booking(db):
+    session = DBSession(session_id="follow-up-session", role="patient")
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    update_memory_from_user_message(
+        db,
+        session.id,
+        "Show Dr. Smith availability for tomorrow morning",
+        {"patient_name": "Demo Patient", "patient_email": "patient@demo.local"},
+    )
+    update_memory_from_tool_calls(
+        db,
+        session.id,
+        [
+            {
+                "tool": "check_availability",
+                "arguments": {"doctor_name": "Dr. Smith", "date_str": "2025-03-16"},
+                "result": {
+                    "available_slots": [
+                        {
+                            "slot_id": 42,
+                            "doctor": "Dr. Smith",
+                            "date": "2025-03-16",
+                            "start_time": "09:00",
+                            "end_time": "09:30",
+                        }
+                    ]
+                },
+            }
+        ],
+    )
+
+    with patch(
+        "app.llm_orchestrator.call_mcp_protocol_tool",
+        return_value={
+            "success": True,
+            "appointment_id": 99,
+            "doctor": "Dr. Smith",
+            "patient": "Demo Patient",
+            "patient_email": "patient@demo.local",
+            "date": "2025-03-16",
+            "start_time": "09:00",
+            "end_time": "09:30",
+        },
+    ) as mocked_call:
+        response, tool_calls = _demo_mode_response(
+            [{"role": "user", "content": "Book the first one"}],
+            db,
+            {"patient_name": "Demo Patient", "patient_email": "patient@demo.local"},
+            load_memory(db, session.id),
+        )
+
+    assert "Appointment confirmed" in response
+    assert tool_calls[0]["arguments"]["slot_id"] == 42
+    mocked_call.assert_called()

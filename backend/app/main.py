@@ -11,6 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.agent_memory import (
+    build_memory_context,
+    load_memory,
+    update_memory_from_tool_calls,
+    update_memory_from_user_message,
+)
 from app.db import SessionLocal, get_db, init_db
 from app.llm_orchestrator import build_messages_from_history, get_llm_response
 from app.mcp_client import MCPClientError, call_tool as call_mcp_protocol_tool, get_legacy_tools_metadata
@@ -96,6 +102,12 @@ class SessionHistoryResponse(BaseModel):
     session_id: str
     session_label: str
     messages: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SessionMemoryResponse(BaseModel):
+    session_id: str
+    summary: str
+    memory: dict[str, Any]
 
 
 class PatientAppointmentActionRequest(BaseModel):
@@ -243,6 +255,17 @@ def get_session_history(session_id: str, db: Session = Depends(get_db)) -> Sessi
     )
 
 
+@app.get("/api/sessions/{session_id}/memory", response_model=SessionMemoryResponse)
+def get_session_memory(session_id: str, db: Session = Depends(get_db)) -> SessionMemoryResponse:
+    session = _get_or_create_session(db, session_id)
+    memory = load_memory(db, session.id)
+    return SessionMemoryResponse(
+        session_id=session.session_id,
+        summary=build_memory_context(memory),
+        memory=memory,
+    )
+
+
 @app.get("/api/doctors")
 def get_doctors() -> dict[str, Any]:
     return call_mcp_protocol_tool("list_doctors", {})
@@ -299,6 +322,15 @@ def call_mcp_tool(tool_name: str, body: MCPToolCallRequest) -> dict[str, Any]:
 @app.post("/api/chat", response_model=ChatResponse)
 def api_chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     session = _get_or_create_session(db, req.session_id)
+    memory_state = update_memory_from_user_message(
+        db,
+        session.id,
+        req.message,
+        {
+            "patient_name": req.patient_name,
+            "patient_email": req.patient_email,
+        },
+    )
 
     db.add(PromptHistory(session_id=session.id, role="user", content=req.message))
     db.commit()
@@ -313,7 +345,10 @@ def api_chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             "patient_name": req.patient_name,
             "patient_email": req.patient_email,
         },
+        memory_state=memory_state,
     )
+
+    updated_memory = update_memory_from_tool_calls(db, session.id, tool_calls_used or [])
 
     db.add(
         PromptHistory(
@@ -326,6 +361,8 @@ def api_chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     db.commit()
 
     available_slots, appointment, alternative_slots = _extract_chat_payload(tool_calls_used)
+    if appointment and not updated_memory.get("last_appointment"):
+        updated_memory["last_appointment"] = appointment
     return ChatResponse(
         session_id=req.session_id,
         session_label=_session_label(req.session_id),

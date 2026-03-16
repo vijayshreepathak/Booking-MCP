@@ -9,7 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.db import get_db, init_db
-from app.mcp_registry import get_tools_metadata
+from app.mcp_tool_registry import registry
+import app.tool_dispatcher  # noqa: F401  Ensures tools register at startup.
 from app.tool_dispatcher import execute_tool
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -48,27 +49,12 @@ def _error(request_id: Optional[str], code: int, message: str) -> dict[str, Any]
         "error": {"code": code, "message": message},
     }
 
-
-def _mcp_tools_payload(base_url: str) -> list[dict[str, Any]]:
-    legacy_tools = get_tools_metadata(base_url)
-    return [
-        {
-            "name": tool["name"],
-            "description": tool["description"],
-            "inputSchema": tool["input_schema"],
-        }
-        for tool in legacy_tools
-    ]
-
-
 @app.post("/mcp")
 async def handle_mcp_request(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
     body = await request.json()
     request_id = body.get("id")
     method = body.get("method")
     params = body.get("params", {}) or {}
-    base_url = os.getenv("BASE_URL", "http://localhost:8000")
-
     if method == "initialize":
         return _success(
             request_id,
@@ -83,7 +69,7 @@ async def handle_mcp_request(request: Request, db: Session = Depends(get_db)) ->
         return _success(request_id, {})
 
     if method == "tools/list":
-        return _success(request_id, {"tools": _mcp_tools_payload(base_url)})
+        return _success(request_id, {"tools": registry.list_protocol_tools()})
 
     if method == "tools/call":
         tool_name = params.get("name")

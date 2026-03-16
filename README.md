@@ -43,6 +43,7 @@ Feel free to reach out if you have questions, feedback, or just want to connect!
 - True MCP client-server separation between the web backend and the MCP tool server
 - FastAPI backend with MCP registry and tool-call endpoints
 - Dedicated MCP server exposing `initialize`, `tools/list`, and `tools/call`
+- Dynamic MCP tool registration backed by a live server-side registry
 - React frontend for patient chat and doctor dashboard
 - PostgreSQL-backed scheduling and appointment data
 - Multi-turn continuity using `Session` and `PromptHistory`
@@ -59,6 +60,7 @@ Feel free to reach out if you have questions, feedback, or just want to connect!
 - Multiple doctor selection in the patient flow
 - Patient self-service appointment change and delete actions
 - Prompt history tracking and restore on refresh
+- Structured session memory for doctor, slots, appointments, and preferences
 - Auto-rescheduling suggestions when a requested slot is unavailable
 
 ## Architecture
@@ -109,14 +111,35 @@ flowchart LR
 4. The backend discovers tools dynamically through `tools/list` and invokes them through `tools/call`.
 5. The MCP server is the only layer that directly executes tool logic against the database and integrations.
 
+### Agent memory model
+
+The application now maintains **structured agent memory** per session rather than relying only on raw chat history.
+
+Stored memory includes:
+
+- patient identity
+- selected doctor
+- requested date and time preferences
+- last offered slots
+- last appointment and active appointments
+- last detected intent
+
+This allows more reliable follow-up behavior such as:
+
+- `Book the first one`
+- `Move it to Dr. Smith`
+- `Cancel my appointment`
+
 ## Project Structure
 
 ```text
 backend/
   app/
     main.py
+    agent_memory.py
     mcp_client.py
     mcp_server_app.py
+    mcp_tool_registry.py
     tools.py
     tool_dispatcher.py
     models.py
@@ -152,6 +175,7 @@ README.md
    - interprets the request
    - discovers tools from the MCP server
    - calls `check_availability` through the MCP client
+   - uses structured session memory to preserve doctor/date/slot context across turns
    - returns available slots in chat and as clickable cards
 4. Patient follows up with:
    - `Book slot 10`
@@ -175,6 +199,7 @@ README.md
 3. Backend calls `query_stats`
 4. Backend invokes `query_stats` and `send_notification` through the MCP client/server boundary
 5. If Slack is not configured, the report is stored as an in-app notification
+6. Structured session memory helps the system preserve prior doctor preferences and recent appointment state across follow-up prompts
 
 ## MCP Interface
 
@@ -187,6 +212,8 @@ Supported MCP methods:
 - `initialize`
 - `tools/list`
 - `tools/call`
+
+`tools/list` is generated from the live MCP registry, so tool discovery is no longer hardcoded in the protocol server.
 
 ### REST compatibility registry
 
@@ -228,6 +255,7 @@ Supported tools:
 | `GET /api/doctors` | List doctors for UI selection |
 | `POST /api/sessions` | Create a session |
 | `GET /api/sessions/{session_id}/history` | Load full conversation history |
+| `GET /api/sessions/{session_id}/memory` | Inspect structured agent memory for the session |
 | `GET /api/patient/appointments` | List patient appointments by email |
 | `DELETE /api/patient/appointments/{appointment_id}` | Cancel/delete a patient appointment |
 | `POST /api/patient/appointments/{appointment_id}/reschedule` | Change a patient appointment |
@@ -323,6 +351,7 @@ The script:
 
 - initializes an MCP session
 - discovers tools through the MCP server
+- uses dynamically discovered tools rather than a hardcoded tool map
 - builds a system prompt
 - sends the example booking request
 - handles tool calls
@@ -440,6 +469,8 @@ npm run build
 - MCP protocol initialization
 - MCP `tools/list` dynamic discovery
 - MCP `tools/call` execution
+- structured session memory capture and retrieval
+- memory-driven follow-up booking resolution
 - multiple doctor listing and selection
 - booking success
 - patient appointment change and delete flows
@@ -455,6 +486,8 @@ npm run build
 This submission is still a demo, but it includes several production-style practices:
 
 - actual protocol-based MCP tool orchestration
+- dynamic registry-backed tool discovery
+- structured agent/session memory
 - clear service boundary between backend client and MCP server
 - modular backend structure
 - clear MCP tool boundaries

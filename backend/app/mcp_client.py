@@ -61,23 +61,12 @@ def call_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 def get_legacy_tools_metadata(base_url: str) -> list[dict[str, Any]]:
     """Convert protocol tool metadata into the legacy REST shape used by the UI/tests."""
     tools = list_tools()
-    output_schema_by_name: dict[str, Any] = {}
-    try:
-        from app.mcp_registry import get_tools_metadata
-
-        output_schema_by_name = {
-            tool["name"]: tool.get("output_schema", {})
-            for tool in get_tools_metadata(base_url)
-        }
-    except Exception:
-        output_schema_by_name = {}
-
     return [
         {
             "name": tool["name"],
             "description": tool["description"],
             "input_schema": tool.get("inputSchema", {}),
-            "output_schema": output_schema_by_name.get(tool["name"], {}),
+            "output_schema": tool.get("outputSchema", {}),
             "call_url": f"{base_url}/mcp/tools/{tool['name']}/call",
         }
         for tool in tools

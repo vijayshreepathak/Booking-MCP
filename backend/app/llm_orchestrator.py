@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+from app.agent_memory import build_memory_context
 from app.mcp_client import call_tool as call_mcp_protocol_tool
 from app.mcp_client import get_legacy_tools_metadata
 
@@ -61,18 +62,47 @@ def build_messages_from_history(db, session_primary_id: int, last_n: int = 12) -
         if item.role == "user":
             messages.append({"role": "user", "content": item.content})
         elif item.role == "assistant":
-            messages.append({"role": "assistant", "content": item.content})
+            content = item.content
+            if item.tool_calls:
+                try:
+                    tool_calls = json.loads(item.tool_calls)
+                except json.JSONDecodeError:
+                    tool_calls = []
+                if tool_calls:
+                    tool_summaries = []
+                    for tool_call in tool_calls:
+                        result = tool_call.get("result", {})
+                        if tool_call.get("tool") == "check_availability":
+                            tool_summaries.append(
+                                f"check_availability returned {len(result.get('available_slots', []))} slots"
+                            )
+                        elif tool_call.get("tool") in {"create_appointment", "reschedule_appointment"} and result.get("success"):
+                            tool_summaries.append(
+                                f"{tool_call.get('tool')} confirmed appointment #{result.get('appointment_id') or result.get('appointment', {}).get('appointment_id')}"
+                            )
+                        elif tool_call.get("tool") == "cancel_appointment" and result.get("success"):
+                            tool_summaries.append("cancel_appointment succeeded")
+                        elif tool_call.get("tool") == "query_stats":
+                            tool_summaries.append(
+                                f"query_stats found {result.get('total_appointments', 0)} appointments"
+                            )
+                    if tool_summaries:
+                        content += "\n[Tool memory] " + "; ".join(tool_summaries)
+            messages.append({"role": "assistant", "content": content})
     return messages
 
 
-def _get_system_prompt() -> str:
+def _get_system_prompt(memory_context: Optional[str] = None) -> str:
     tools = json.dumps(_fetch_tools_metadata(), indent=2)
-    return (
+    prompt = (
         "You are a medical appointment assistant that can discover and call MCP tools.\n"
         "Use check_availability before create_appointment when the user asks to book.\n"
         "Use query_stats for doctor reporting and send_notification for doctor delivery.\n"
         f"Available tools:\n{tools}"
     )
+    if memory_context:
+        prompt += f"\nStructured session memory:\n{memory_context}"
+    return prompt
 
 
 def _extract_email(text: str) -> Optional[str]:
@@ -109,6 +139,27 @@ def _extract_appointment_id(text: str) -> Optional[int]:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return int(match.group(1))
+    return None
+
+
+def _extract_relative_choice(text: str) -> Optional[int]:
+    lowered = (text or "").lower()
+    mapping = {
+        "first": 0,
+        "1st": 0,
+        "second": 1,
+        "2nd": 1,
+        "third": 2,
+        "3rd": 2,
+        "fourth": 3,
+        "4th": 3,
+        "last": -1,
+    }
+    for key, value in mapping.items():
+        if key in lowered:
+            return value
+    if any(token in lowered for token in ["earliest", "next available", "book it", "book that", "book this"]):
+        return 0
     return None
 
 
@@ -185,20 +236,46 @@ def _latest_user_context(messages: list[dict]) -> dict[str, Any]:
     return context
 
 
-def get_llm_response(messages: list, db=None, patient_context: Optional[dict] = None) -> tuple[str, list]:
+def _merge_memory_context(memory_state: Optional[dict[str, Any]], message_context: dict[str, Any]) -> dict[str, Any]:
+    memory_state = memory_state or {}
+    return {
+        "email": message_context.get("email") or memory_state.get("patient_email"),
+        "name": message_context.get("name") or memory_state.get("patient_name"),
+        "doctor": message_context.get("doctor") or memory_state.get("selected_doctor"),
+        "date_str": message_context.get("date_str") or memory_state.get("requested_date"),
+        "requested_time": memory_state.get("requested_time"),
+        "last_available_slots": memory_state.get("last_available_slots", []),
+        "last_appointment_id": memory_state.get("last_appointment_id"),
+        "active_appointments": memory_state.get("active_appointments", []),
+        "time_preference": memory_state.get("time_preference"),
+    }
+
+
+def get_llm_response(
+    messages: list,
+    db=None,
+    patient_context: Optional[dict] = None,
+    memory_state: Optional[dict[str, Any]] = None,
+) -> tuple[str, list]:
     if LLM_PROVIDER == "demo":
-        return _demo_mode_response(messages, db, patient_context or {})
+        return _demo_mode_response(messages, db, patient_context or {}, memory_state or {})
     if LLM_PROVIDER == "openai" and OPENAI_API_KEY:
-        return _openai_response(messages, db)
+        return _openai_response(messages, db, memory_state)
     if LLM_PROVIDER == "anthropic" and ANTHROPIC_API_KEY:
-        return _anthropic_response(messages, db)
+        return _anthropic_response(messages, db, memory_state)
     if LLM_PROVIDER == "local":
-        return _local_llm_response(messages, db)
-    return _demo_mode_response(messages, db, patient_context or {})
+        return _local_llm_response(messages, db, memory_state)
+    return _demo_mode_response(messages, db, patient_context or {}, memory_state or {})
 
 
-def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict] = None) -> tuple[str, list]:
+def _demo_mode_response(
+    messages: list,
+    db=None,
+    patient_context: Optional[dict] = None,
+    memory_state: Optional[dict[str, Any]] = None,
+) -> tuple[str, list]:
     patient_context = patient_context or {}
+    memory_state = memory_state or {}
     user_content = ""
     for message in reversed(messages):
         if message.get("role") == "user":
@@ -207,8 +284,8 @@ def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict]
 
     lower = user_content.lower()
     tool_calls: list[dict[str, Any]] = []
-    context = _latest_user_context(messages)
-    doctor_name = _resolve_doctor_name(user_content, messages)
+    context = _merge_memory_context(memory_state, _latest_user_context(messages))
+    doctor_name = context["doctor"] or _resolve_doctor_name(user_content, messages)
     date_str = context["date_str"] or _resolve_date(user_content)
     patient_email = (
         patient_context.get("patient_email")
@@ -230,6 +307,19 @@ def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict]
     slot_id = _extract_slot_id(user_content)
     appointment_id = _extract_appointment_id(user_content)
     time_str = _extract_time(user_content)
+    relative_choice = _extract_relative_choice(user_content)
+
+    if slot_id is None and time_str is None and relative_choice is not None and context["last_available_slots"]:
+        try:
+            slot = context["last_available_slots"][relative_choice]
+            slot_id = slot.get("slot_id")
+            doctor_name = slot.get("doctor") or doctor_name
+            date_str = slot.get("date") or date_str
+        except IndexError:
+            pass
+
+    if appointment_id is None and len(context["active_appointments"]) == 1:
+        appointment_id = context["active_appointments"][0].get("appointment_id")
 
     if wants_doctors:
         doctors_result = _call_tool("list_doctors", {}, db)
@@ -346,9 +436,9 @@ def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict]
         if not slots:
             return result.get("error") or f"No available slots found for {doctor_name} on {date_str}.", tool_calls
 
-        if "morning" in lower:
+        if "morning" in lower or context.get("time_preference") == "morning":
             slots = [slot for slot in slots if slot["start_time"] < "12:00"] or slots
-        elif "afternoon" in lower:
+        elif "afternoon" in lower or context.get("time_preference") == "afternoon":
             slots = [slot for slot in slots if slot["start_time"] >= "12:00"] or slots
 
         slot_lines = [
@@ -369,11 +459,11 @@ def _demo_mode_response(messages: list, db=None, patient_context: Optional[dict]
     )
 
 
-def _openai_response(messages: list, db=None) -> tuple[str, list]:
+def _openai_response(messages: list, db=None, memory_state: Optional[dict[str, Any]] = None) -> tuple[str, list]:
     """Use OpenAI API with function calling."""
     from openai import OpenAI
     client = OpenAI(api_key=OPENAI_API_KEY)
-    system_content = _get_system_prompt()
+    system_content = _get_system_prompt(build_memory_context(memory_state or {}))
     msgs = [{"role": "system", "content": system_content}] + [
         {"role": m["role"], "content": m.get("content", "")} for m in messages
     ]
@@ -409,11 +499,11 @@ def _openai_response(messages: list, db=None) -> tuple[str, list]:
     return "I couldn't complete the request.", tool_calls_made
 
 
-def _anthropic_response(messages: list, db=None) -> tuple[str, list]:
+def _anthropic_response(messages: list, db=None, memory_state: Optional[dict[str, Any]] = None) -> tuple[str, list]:
     """Use Anthropic Claude with tool use."""
     import anthropic
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    system_content = _get_system_prompt()
+    system_content = _get_system_prompt(build_memory_context(memory_state or {}))
     msgs = [{"role": m["role"], "content": m.get("content", "")} for m in messages]
     tools = []
     for t in _fetch_tools_metadata():
@@ -463,11 +553,11 @@ def _anthropic_response(messages: list, db=None) -> tuple[str, list]:
     return "Could not complete.", tool_calls_made
 
 
-def _local_llm_response(messages: list, db=None) -> tuple[str, list]:
+def _local_llm_response(messages: list, db=None, memory_state: Optional[dict[str, Any]] = None) -> tuple[str, list]:
     """Use local LLM via HTTP (e.g. Ollama-compatible)."""
     import httpx
 
-    system_content = _get_system_prompt()
+    system_content = _get_system_prompt(build_memory_context(memory_state or {}))
     msgs = [{"role": "system", "content": system_content}] + [
         {"role": m["role"], "content": m.get("content", "")} for m in messages
     ]
@@ -486,4 +576,4 @@ def _local_llm_response(messages: list, db=None) -> tuple[str, list]:
             return content or "No response.", []
     except Exception:
         pass
-    return _demo_mode_response(messages, db)
+    return _demo_mode_response(messages, db, {}, memory_state or {})
